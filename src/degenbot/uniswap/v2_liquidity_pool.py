@@ -234,7 +234,6 @@ class LiquidityPool(BaseLiquidityPool):
                     )
                 )
                 session.commit()
-                print(f"Saved pool data to cache: {self}")
 
         if not silent:  # pragma: no cover
             logger.info(self.name)
