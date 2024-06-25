@@ -2,6 +2,7 @@ import pathlib
 
 import web3
 import web3.providers
+import pathlib
 
 from .exceptions import DegenbotError
 from .logging import logger
