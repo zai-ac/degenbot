@@ -1,15 +1,17 @@
 from bisect import bisect_left
 from fractions import Fraction
 from threading import Lock
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Tuple
 
-from eth_typing import BlockNumber, ChecksumAddress
+import sqlmodel
+from eth_typing import ChecksumAddress
 from eth_utils.address import to_checksum_address
 from typing_extensions import override
 from web3.contract.contract import Contract
 
 from .. import config
 from ..baseclasses import BaseLiquidityPool
+from ..cache.database import UniswapV2LiquidityPoolData, get_db_session
 from ..erc20_token import Erc20Token
 from ..exceptions import (
     ExternalUpdateError,
@@ -104,20 +106,62 @@ class LiquidityPool(BaseLiquidityPool):
                 "Empty LiquidityPool cannot be created without pool, factory, and token addresses"
             )
 
-        self.factory: ChecksumAddress
         self._state: UniswapV2PoolState | None = None
         self._state_lock = Lock()
 
-        self.address: ChecksumAddress = to_checksum_address(address)
+        self.address = to_checksum_address(address)
         self.abi = abi if abi is not None else UNISWAP_V2_POOL_ABI
 
-        _w3 = config.get_web3()
-        _w3_contract = self._w3_contract
+        w3 = config.get_web3()
+        w3_contract = self._w3_contract
+        chain_id = w3.eth.chain_id
 
-        if factory_address:
-            if factory_init_hash is None:
-                raise ValueError(f"Init hash not provided for factory {factory_address}")
-            self.factory = to_checksum_address(factory_address)
+        if state_block is None:
+            state_block = w3.eth.block_number
+
+        with get_db_session() as session:
+            selection = sqlmodel.select(UniswapV2LiquidityPoolData).where(
+                UniswapV2LiquidityPoolData.address == self.address,
+                UniswapV2LiquidityPoolData.chain_id == w3.eth.chain_id,
+            )
+            cached_pool_data = session.exec(selection).first()
+
+        self.factory: ChecksumAddress
+        self.fee_token0: int
+        self.fee_token1: int
+
+        if cached_pool_data:
+            if TYPE_CHECKING:
+                assert isinstance(cached_pool_data, UniswapV2LiquidityPoolData)
+            self.factory = to_checksum_address(cached_pool_data.factory)
+            self.fee_token0 = Fraction(
+                cached_pool_data.fee_token0_numerator, cached_pool_data.fee_token0_denominator
+            )
+            self.fee_token1 = Fraction(
+                cached_pool_data.fee_token1_numerator, cached_pool_data.fee_token1_denominator
+            )
+            token0_address = cached_pool_data.token0
+            token1_address = cached_pool_data.token1
+        else:
+            self.factory = (
+                to_checksum_address(factory_address)
+                if factory_address is not None
+                else w3_contract.functions.factory().call(block_identifier=state_block)
+            )
+            token0_address = w3_contract.functions.token0().call(block_identifier=state_block)
+            token1_address = w3_contract.functions.token1().call(block_identifier=state_block)
+
+        if tokens is not None:
+            if len(tokens) != 2:
+                raise ValueError(f"Expected 2 tokens, found {len(tokens)}")
+            self.token0 = min(tokens)
+            self.token1 = max(tokens)
+        else:
+            token_manager = Erc20TokenHelperManager(chain_id)
+            self.token0 = token_manager.get_erc20token(address=token0_address, silent=silent)
+            self.token1 = token_manager.get_erc20token(address=token1_address, silent=silent)
+
+        self.tokens = (self.token0, self.token1)
 
         if isinstance(fee, Iterable):
             self.fee_token0, self.fee_token1 = fee
@@ -140,31 +184,7 @@ class LiquidityPool(BaseLiquidityPool):
                 )
 
         self._update_method = update_method
-        self.update_block: BlockNumber | int = _w3.eth.get_block_number()
-        self.factory = (
-            to_checksum_address(factory_address)
-            if factory_address is not None
-            else _w3_contract.functions.factory().call()
-        )
-
-        chain_id = _w3.eth.chain_id
-        if tokens is not None:
-            if len(tokens) != 2:
-                raise ValueError(f"Expected 2 tokens, found {len(tokens)}")
-            self.token0 = min(tokens)
-            self.token1 = max(tokens)
-        else:
-            _token_manager = Erc20TokenHelperManager(chain_id)
-            self.token0 = _token_manager.get_erc20token(
-                address=_w3_contract.functions.token0().call(),
-                silent=silent,
-            )
-            self.token1 = _token_manager.get_erc20token(
-                address=_w3_contract.functions.token1().call(),
-                silent=silent,
-            )
-
-        self.tokens = (self.token0, self.token1)
+        self.update_block = w3.eth.get_block_number()
 
         if factory_address is not None and factory_init_hash is not None:
             computed_pool_address = generate_v2_pool_address(
@@ -197,6 +217,24 @@ class LiquidityPool(BaseLiquidityPool):
         AllPools(chain_id)[self.address] = self
 
         self._subscribers = set()
+
+        if not cached_pool_data:
+            with get_db_session() as session:
+                session.add(
+                    UniswapV2LiquidityPoolData(
+                        chain_id=w3.eth.chain_id,
+                        address=self.address,
+                        factory=self.factory,
+                        token0=self.token0.address,
+                        token1=self.token1.address,
+                        fee_token0_numerator=self.fee_token0.numerator,
+                        fee_token0_denominator=self.fee_token0.denominator,
+                        fee_token1_numerator=self.fee_token1.numerator,
+                        fee_token1_denominator=self.fee_token1.denominator,
+                    )
+                )
+                session.commit()
+                print(f"Saved pool data to cache: {self}")
 
         if not silent:  # pragma: no cover
             logger.info(self.name)

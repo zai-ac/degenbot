@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Tuple
 
 import eth_abi.abi
+import sqlmodel
 import ujson
 from eth_typing import AnyAddress, ChecksumAddress
 from eth_utils.address import to_checksum_address
@@ -11,6 +12,7 @@ from web3.types import BlockIdentifier
 
 from . import config
 from .baseclasses import BaseToken
+from .cache.database import Erc20TokenData, get_db_session
 from .chainlink import ChainlinkPriceContract
 from .functions import get_number_for_block_identifier
 from .logging import logger
@@ -58,112 +60,136 @@ class Erc20Token(BaseToken):
         oracle_address: str | None = None,
         silent: bool = False,
     ) -> None:
+        def get_token_decimals() -> int:
+            decimals: int | None = None
+
+            try:
+                decimals = _w3_contract.functions.decimals().call()
+            except (ContractLogicError, OverflowError, BadFunctionCallOutput):
+                for func in ("decimals", "DECIMALS"):
+                    try:
+                        # Workaround for non-ERC20 compliant tokens
+                        decimals = int.from_bytes(
+                            bytes=_w3.eth.call(
+                                {
+                                    "to": self.address,
+                                    "data": Web3.keccak(text=f"{func}()"),
+                                }
+                            ),
+                            byteorder="big",
+                        )
+                    except Exception:
+                        continue
+                    else:
+                        break
+            except Exception as e:
+                print(f"(token.decimals @ {self.address}) {type(e)}: {e}")
+                raise
+
+            if decimals is None:
+                if not _w3.eth.get_code(self.address):  # pragma: no cover
+                    raise ValueError("No contract deployed at this address")
+                decimals = 0
+                logger.warning(
+                    f"Token contract at {self.address} does not implement a 'decimals' function. Setting to {decimals}."
+                )
+
+            return decimals
+
+        def get_token_name() -> str:
+            name: str | None = None
+
+            try:
+                name = _w3_contract.functions.name().call()
+            except (ContractLogicError, OverflowError, BadFunctionCallOutput):
+                # Workaround for non-ERC20 compliant tokens
+                for func in ("name", "NAME"):
+                    try:
+                        name = (
+                            _w3.eth.call(
+                                {
+                                    "to": self.address,
+                                    "data": Web3.keccak(text=f"{func}()"),
+                                }
+                            )
+                        ).decode("utf-8", errors="ignore")
+                    except Exception:
+                        continue
+                    else:
+                        break
+            except Exception as e:
+                print(f"(token.name @ {self.address}) {type(e)}: {e}")
+                raise
+
+            if name is None:
+                if not _w3.eth.get_code(self.address):  # pragma: no cover
+                    raise ValueError("No contract deployed at this address")
+                name = "Unknown"
+                logger.warning(
+                    f"Token contract at {self.address} does not implement a 'name' function. Setting to '{name}'"
+                )
+
+            return name
+
+        def get_token_symbol() -> str:
+            symbol: str | None = None
+
+            try:
+                symbol = _w3_contract.functions.symbol().call()
+            except (ContractLogicError, OverflowError, BadFunctionCallOutput):
+                for func in ("symbol", "SYMBOL"):
+                    # Workaround for non-ERC20 compliant tokens
+                    try:
+                        symbol = (
+                            _w3.eth.call(
+                                {
+                                    "to": self.address,
+                                    "data": Web3.keccak(text=f"{func}()"),
+                                }
+                            )
+                        ).decode("utf-8", errors="ignore")
+                    except Exception:
+                        continue
+                    else:
+                        break
+            except Exception as e:
+                print(f"(token.symbol @ {self.address}) {type(e)}: {e}")
+                raise
+
+            if symbol is None:
+                if not _w3.eth.get_code(self.address):  # pragma: no cover
+                    raise ValueError("No contract deployed at this address")
+                symbol = "UNKN"
+                logger.warning(
+                    f"Token contract at {self.address} does not implement a 'symbol' function. Setting to {symbol}"
+                )
+
+            return symbol
+
         self.address: ChecksumAddress = to_checksum_address(address)
         self.abi = abi if abi is not None else ERC20_ABI_MINIMAL
 
         _w3 = config.get_web3()
         _w3_contract = self._w3_contract
 
-        try:
-            self.name: str
-            self.name = _w3_contract.functions.name().call()
-        except (ContractLogicError, OverflowError, BadFunctionCallOutput):
-            # Workaround for non-ERC20 compliant tokens
-            for func in ("name", "NAME"):
-                try:
-                    self.name = (
-                        _w3.eth.call(
-                            {
-                                "to": self.address,
-                                "data": Web3.keccak(text=f"{func}()"),
-                            }
-                        )
-                    ).decode("utf-8", errors="ignore")
-                except Exception:
-                    continue
-                else:
-                    break
-        except Exception as e:
-            print(f"(token.name @ {self.address}) {type(e)}: {e}")
-            raise
-
-        try:
-            self.name
-        except AttributeError:
-            if not _w3.eth.get_code(self.address):  # pragma: no cover
-                raise ValueError("No contract deployed at this address")
-            self.name = "Unknown"
-            self.name = self.name.strip("\x00")
-            logger.warning(
-                f"Token contract at {self.address} does not implement a 'name' function. Setting to '{self.name}'"
+        with get_db_session() as session:
+            selection = sqlmodel.select(Erc20TokenData).where(
+                Erc20TokenData.address == self.address, Erc20TokenData.chain_id == _w3.eth.chain_id
             )
+            cached_token_data = session.exec(selection).first()
 
-        try:
-            self.symbol: str
-            self.symbol = _w3_contract.functions.symbol().call()
-        except (ContractLogicError, OverflowError, BadFunctionCallOutput):
-            for func in ("symbol", "SYMBOL"):
-                # Workaround for non-ERC20 compliant tokens
-                try:
-                    self.symbol = (
-                        _w3.eth.call(
-                            {
-                                "to": self.address,
-                                "data": Web3.keccak(text=f"{func}()"),
-                            }
-                        )
-                    ).decode("utf-8", errors="ignore")
-                except Exception:
-                    continue
-                else:
-                    break
-        except Exception as e:
-            print(f"(token.symbol @ {self.address}) {type(e)}: {e}")
-            raise
+        self.decimals: int
+        self.name: str
+        self.symbol: str
 
-        try:
-            self.symbol
-        except AttributeError:
-            if not _w3.eth.get_code(self.address):  # pragma: no cover
-                raise ValueError("No contract deployed at this address")
-            self.symbol = "UNKN"
-            logger.warning(
-                f"Token contract at {self.address} does not implement a 'symbol' function. Setting to {self.symbol}"
-            )
-
-        try:
-            self.decimals: int
-            self.decimals = _w3_contract.functions.decimals().call()
-        except (ContractLogicError, OverflowError, BadFunctionCallOutput):
-            for func in ("decimals", "DECIMALS"):
-                try:
-                    # Workaround for non-ERC20 compliant tokens
-                    self.decimals = int.from_bytes(
-                        bytes=_w3.eth.call(
-                            {
-                                "to": self.address,
-                                "data": Web3.keccak(text=f"{func}()"),
-                            }
-                        ),
-                        byteorder="big",
-                    )
-                except Exception:
-                    continue
-                else:
-                    break
-        except Exception as e:
-            print(f"(token.decimals @ {self.address}) {type(e)}: {e}")
-            raise
-
-        try:
-            self.decimals
-        except Exception:
-            if not _w3.eth.get_code(self.address):  # pragma: no cover
-                raise ValueError("No contract deployed at this address")
-            self.decimals = 0
-            logger.warning(
-                f"Token contract at {self.address} does not implement a 'decimals' function. Setting to 0."
-            )
+        if cached_token_data:
+            self.decimals = cached_token_data.decimals
+            self.name = cached_token_data.name
+            self.symbol = cached_token_data.symbol
+        else:
+            self.decimals = get_token_decimals()
+            self.name = get_token_name()
+            self.symbol = get_token_symbol()
 
         self.price: float | None = None
         if oracle_address:
@@ -177,6 +203,20 @@ class Erc20Token(BaseToken):
         self._cached_approval: Dict[Tuple[int, ChecksumAddress, ChecksumAddress], int] = {}
         self._cached_balance: Dict[Tuple[int, ChecksumAddress], int] = {}
         self._cached_total_supply: Dict[int, int] = {}
+
+        if not cached_token_data:
+            with get_db_session() as session:
+                session.add(
+                    Erc20TokenData(
+                        address=self.address,
+                        chain_id=_w3.eth.chain_id,
+                        name=self.name,
+                        symbol=self.symbol,
+                        decimals=self.decimals,
+                    )
+                )
+                session.commit()
+                print(f"Saved token data to cache: {self.symbol}")
 
         if not silent:  # pragma: no cover
             logger.info(f"• {self.symbol} ({self.name})")

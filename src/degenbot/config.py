@@ -1,5 +1,6 @@
 import web3
 import web3.providers
+import pathlib
 
 from .exceptions import DegenbotError
 from .logging import logger
@@ -7,6 +8,20 @@ from .logging import logger
 _web3: web3.Web3
 _provider_address: str
 _ipc_path: str
+_cache_dir = pathlib.Path.home() / ".degenbot"
+
+
+def set_cache_dir(path) -> None:
+    global _cache_dir
+    _cache_dir = path
+
+
+def get_cache_dir() -> pathlib.Path:
+    return _cache_dir
+
+
+def get_cache_path() -> pathlib.Path:
+    return _cache_dir / "cache.sqlite"
 
 
 def get_web3() -> web3.Web3:
@@ -45,3 +60,12 @@ def set_web3(w3: web3.Web3) -> None:
         _provider_address = w3.provider.endpoint_uri
     if isinstance(w3.provider, web3.IPCProvider):
         _ipc_path = w3.provider.ipc_path
+
+
+if not pathlib.Path.exists(get_cache_path()):
+    from .cache.database import create_database_and_tables
+
+    pathlib.Path.mkdir(_cache_dir, parents=True)
+    print(f"Created cache in {_cache_dir}")
+    create_database_and_tables()
+    print(f"Created DB at {get_cache_path()}")

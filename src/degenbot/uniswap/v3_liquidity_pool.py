@@ -8,12 +8,14 @@ from fractions import Fraction
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 
+import sqlmodel
 from eth_typing import ChecksumAddress
 from eth_utils.address import to_checksum_address
 from web3.contract.contract import Contract
 
 from .. import config
 from ..baseclasses import BaseLiquidityPool
+from ..cache.database import UniswapV3LiquidityPoolData, get_db_session
 from ..dex.uniswap import TICKLENS_ADDRESSES
 from ..erc20_token import Erc20Token
 from ..exceptions import (
@@ -80,8 +82,18 @@ class V3LiquidityPool(BaseLiquidityPool):
         self.address = to_checksum_address(address)
         self.abi = abi if abi is not None else UNISWAP_V3_POOL_ABI
 
-        _w3 = config.get_web3()
-        _w3_contract = self._w3_contract
+        w3 = config.get_web3()
+        w3_contract = self._w3_contract
+
+        if state_block is None:
+            state_block = w3.eth.block_number
+
+        with get_db_session() as session:
+            selection = sqlmodel.select(UniswapV3LiquidityPoolData).where(
+                UniswapV3LiquidityPoolData.address == self.address,
+                UniswapV3LiquidityPoolData.chain_id == w3.eth.chain_id,
+            )
+            cached_pool_data = session.exec(selection).first()
 
         self.state: UniswapV3PoolState = UniswapV3PoolState(
             pool=self.address,
@@ -92,10 +104,44 @@ class V3LiquidityPool(BaseLiquidityPool):
             tick_data=dict(),
         )
 
+        self._fee: int
+        self.factory: ChecksumAddress
+        self.deployer: ChecksumAddress | None
+
+        if cached_pool_data:
+            self.factory = to_checksum_address(cached_pool_data.factory)
+            token0_address = to_checksum_address(cached_pool_data.token0)
+            token1_address = to_checksum_address(cached_pool_data.token1)
+            self._fee = cached_pool_data.fee
+            deployer_address = cached_pool_data.deployer
+        else:
+            self.factory = to_checksum_address(w3_contract.functions.factory().call())
+            token0_address = to_checksum_address(w3_contract.functions.token0().call())
+            token1_address = to_checksum_address(w3_contract.functions.token1().call())
+            self._fee = w3_contract.functions.fee().call()
+
+        if deployer_address:
+            self.deployer = to_checksum_address(deployer_address)
+        else:
+            self.deployer = self.factory
+
+        token_manager = Erc20TokenHelperManager(w3.eth.chain_id)
+        self.token0 = token_manager.get_erc20token(
+            address=token0_address,
+            silent=silent,
+        )
+        self.token1 = token_manager.get_erc20token(
+            address=token1_address,
+            silent=silent,
+        )
+        self.tokens = (self.token0, self.token1)
+
+        self._tick_spacing = self._TICKSPACING_BY_FEE[self._fee]  # immutable
+
         # held for operations that manipulate state data
         self._state_lock = Lock()
 
-        self._update_block = state_block if state_block else _w3.eth.get_block_number()
+        self._update_block = state_block if state_block else w3.eth.get_block_number()
 
         self.init_hash: str | None = None
         if factory_init_hash is not None:
@@ -104,57 +150,15 @@ class V3LiquidityPool(BaseLiquidityPool):
             )
             self.init_hash = factory_init_hash
 
-        if factory_address:
-            self.factory = to_checksum_address(factory_address)
-        else:
-            self.factory = to_checksum_address(_w3_contract.functions.factory().call())
-
-        if deployer_address:
-            self.deployer = to_checksum_address(deployer_address)
-        else:
-            self.deployer = self.factory
-
         if lens:
             self.lens = lens
         else:
             # Use the singleton TickLens helper if available
             try:
-                self.lens = self._lens_contracts[(_w3.eth.chain_id, self.factory)]
+                self.lens = self._lens_contracts[(w3.eth.chain_id, self.factory)]
             except KeyError:
-                self.lens = TickLens(address=TICKLENS_ADDRESSES[_w3.eth.chain_id][self.factory])
-                self._lens_contracts[(_w3.eth.chain_id, self.factory)] = self.lens
-
-        token0_address: ChecksumAddress = to_checksum_address(
-            _w3_contract.functions.token0().call()
-        )
-        token1_address: ChecksumAddress = to_checksum_address(
-            _w3_contract.functions.token1().call()
-        )
-
-        if tokens is not None:
-            if len(tokens) != 2:
-                raise ValueError(f"Expected exactly two tokens, found {len(tokens)}")
-
-            self.token0 = min(tokens)
-            self.token1 = max(tokens)
-
-            if not (self.token0 == token0_address and self.token1 == token1_address):
-                raise ValueError("Token addresses do not match tokens recorded at contract")
-        else:
-            _token_manager = Erc20TokenHelperManager(_w3.eth.chain_id)
-            self.token0 = _token_manager.get_erc20token(
-                address=token0_address,
-                silent=silent,
-            )
-            self.token1 = _token_manager.get_erc20token(
-                address=token1_address,
-                silent=silent,
-            )
-
-        self.tokens = (self.token0, self.token1)
-
-        self._fee: int = fee if fee is not None else _w3_contract.functions.fee().call()
-        self._tick_spacing = self._TICKSPACING_BY_FEE[self._fee]  # immutable
+                self.lens = TickLens(address=TICKLENS_ADDRESSES[w3.eth.chain_id][self.factory])
+                self._lens_contracts[(w3.eth.chain_id, self.factory)] = self.lens
 
         if self.deployer is not None and init_hash is not None:
             computed_pool_address = generate_v3_pool_address(
@@ -229,15 +233,13 @@ class V3LiquidityPool(BaseLiquidityPool):
                 block_number=self._update_block,
             )
 
-        self.liquidity = _w3_contract.functions.liquidity().call(
-            block_identifier=self._update_block
-        )
+        self.liquidity = w3_contract.functions.liquidity().call(block_identifier=self._update_block)
 
         (
             self.sqrt_price_x96,
             self.tick,
             *_,
-        ) = _w3_contract.functions.slot0().call(block_identifier=self._update_block)
+        ) = w3_contract.functions.slot0().call(block_identifier=self._update_block)
 
         self._pool_state_archive: Dict[int, UniswapV3PoolState] = {
             0: UniswapV3PoolState(
@@ -249,9 +251,24 @@ class V3LiquidityPool(BaseLiquidityPool):
             self._update_block: self.state,
         }
 
-        AllPools(_w3.eth.chain_id)[self.address] = self
+        AllPools(w3.eth.chain_id)[self.address] = self
 
         self._subscribers = set()
+
+        if not cached_pool_data:
+            with get_db_session() as session:
+                session.add(
+                    UniswapV3LiquidityPoolData(
+                        chain_id=w3.eth.chain_id,
+                        address=self.address,
+                        factory=self.factory,
+                        deployer=self.deployer,
+                        token0=self.token0.address,
+                        token1=self.token1.address,
+                        fee=self._fee,
+                    )
+                )
+                session.commit()
 
         if not silent:  # pragma: no cover
             logger.info(self.name)
