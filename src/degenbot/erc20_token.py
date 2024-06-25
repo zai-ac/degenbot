@@ -216,7 +216,6 @@ class Erc20Token(BaseToken):
                     )
                 )
                 session.commit()
-                print(f"Saved token data to cache: {self.symbol}")
 
         if not silent:  # pragma: no cover
             logger.info(f"• {self.symbol} ({self.name})")
