@@ -1,17 +1,18 @@
+import pathlib
+
 import web3
 import web3.providers
-import pathlib
 
 from .exceptions import DegenbotError
 from .logging import logger
 
 _web3: web3.Web3
 _provider_address: str
-_ipc_path: str
+_ipc_path: pathlib.Path
 _cache_dir = pathlib.Path.home() / ".degenbot"
 
 
-def set_cache_dir(path) -> None:
+def set_cache_dir(path: pathlib.Path) -> None:
     global _cache_dir
     _cache_dir = path
 
@@ -56,10 +57,11 @@ def set_web3(w3: web3.Web3) -> None:
     global _ipc_path
 
     _web3 = w3
-    if isinstance(w3.provider, (web3.HTTPProvider, web3.WebsocketProvider)):
-        _provider_address = w3.provider.endpoint_uri
-    if isinstance(w3.provider, web3.IPCProvider):
-        _ipc_path = w3.provider.ipc_path
+    match w3.provider:
+        case web3.HTTPProvider() | web3.WebsocketProvider():
+            _provider_address = w3.provider.endpoint_uri  # type: ignore[assignment]
+        case web3.IPCProvider():
+            _ipc_path = w3.provider.ipc_path  # type: ignore[has-type]
 
 
 if not pathlib.Path.exists(get_cache_path()):
