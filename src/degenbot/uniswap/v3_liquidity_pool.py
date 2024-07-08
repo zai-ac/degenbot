@@ -32,8 +32,6 @@ from ..manager.token_manager import Erc20TokenHelperManager
 from ..registry.all_pools import AllPools
 from .abi import UNISWAP_V3_POOL_ABI
 from .v3_dataclasses import (
-    UniswapV3BitmapAtWord,
-    UniswapV3LiquidityAtTick,
     UniswapV3PoolExternalUpdate,
     UniswapV3PoolSimulationResult,
     UniswapV3PoolState,
