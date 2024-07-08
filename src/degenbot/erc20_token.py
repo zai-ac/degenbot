@@ -223,6 +223,26 @@ class Erc20Token(BaseToken):
     def __repr__(self) -> str:  # pragma: no cover
         return f"Erc20Token(address={self.address}, symbol='{self.symbol}', name='{self.name}', decimals={self.decimals})"
 
+    def __getstate__(self) -> Dict[str, Any]:
+        # Remove objects that either cannot be pickled or are unnecessary to perform the calculation
+        copied_attributes = ()
+        dropped_attributes = (
+            "abi",
+            "decimals",
+            "name",
+            "symbol",
+            "price",
+            "_cached_approval",
+            "_cached_balance",
+            "_cached_total_supply",
+        )
+
+        return {
+            k: (v.copy() if k in copied_attributes else v)
+            for k, v in self.__dict__.items()
+            if k not in dropped_attributes
+        }
+
     @property
     def _w3_contract(self) -> Contract:
         return config.get_web3().eth.contract(

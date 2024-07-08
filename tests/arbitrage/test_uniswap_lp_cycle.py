@@ -29,7 +29,7 @@ from degenbot.uniswap.v3_dataclasses import (
     UniswapV3LiquidityAtTick,
     UniswapV3PoolState,
 )
-from degenbot.uniswap.v3_liquidity_pool import V3LiquidityPool
+from degenbot.uniswap.v3_liquidity_pool import EMPTY_TICK_BITMAP, EMPTY_TICK_DATA, V3LiquidityPool
 from eth_utils.address import to_checksum_address
 
 WBTC_ADDRESS = "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
@@ -2201,8 +2201,8 @@ def test_arbitrage_with_overrides(
         liquidity=0,
         sqrt_price_x96=0,
         tick=0,
-        tick_bitmap={},
-        tick_data={},
+        tick_bitmap=EMPTY_TICK_BITMAP,
+        tick_data=EMPTY_TICK_DATA,
     )
     irrelevant_v3_pool.name = "WBTC-WETH (V3, 0.30%)"
     irrelevant_v3_pool.factory = to_checksum_address("0x1F98431c8aD98523631AE4a59f267346ea31F984")
@@ -2279,11 +2279,46 @@ async def test_pickle_uniswap_lp_cycle_with_camelot_pool(fork_arbitrum: AnvilFor
         pass
 
 
+async def test_thread_pool_calculation(
+    wbtc_weth_arb: UniswapLpCycle, wbtc_weth_v3_lp: V3LiquidityPool, weth_token: Erc20Token
+):
+    v3_pool_state_override = UniswapV3PoolState(
+        pool=wbtc_weth_v3_lp.address,
+        liquidity=1533143241938066251,
+        sqrt_price_x96=31881290961944305252140777263703426,
+        tick=258116,
+    )
+
+    overrides = [
+        (wbtc_weth_v3_lp, v3_pool_state_override),
+    ]
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        start = time.perf_counter()
+
+        # Saturate the process pool executor with multiple calculations.
+        # Should reveal cases of excessive latency.
+        _NUM_FUTURES = 512
+        calculation_futures = []
+        for _ in range(_NUM_FUTURES):
+            calculation_futures.append(
+                await wbtc_weth_arb.calculate_with_pool(
+                    executor=executor,
+                    override_state=overrides,
+                )
+            )
+        print(f"Built futures, {time.perf_counter()-start:.2f}s since start")
+
+        assert len(calculation_futures) == _NUM_FUTURES
+        for i, task in enumerate(asyncio.as_completed(calculation_futures)):
+            await task
+            print(f"Completed process_pool calc #{i}, {time.perf_counter()-start:.2f}s since start")
+        print(f"Completed {_NUM_FUTURES} calculations in {time.perf_counter() - start:.1f}s")
+
+
 async def test_process_pool_calculation(
     wbtc_weth_arb: UniswapLpCycle, wbtc_weth_v3_lp: V3LiquidityPool, weth_token: Erc20Token
 ):
-    start = time.perf_counter()
-
     v3_pool_state_override = UniswapV3PoolState(
         pool=wbtc_weth_v3_lp.address,
         liquidity=1533143241938066251,
@@ -2298,6 +2333,18 @@ async def test_process_pool_calculation(
     with concurrent.futures.ProcessPoolExecutor(
         mp_context=multiprocessing.get_context("spawn"),
     ) as executor:
+        calculation_futures = []
+        for _ in range(64):
+            calculation_futures.append(
+                await wbtc_weth_arb.calculate_with_pool(
+                    executor=executor,
+                    override_state=overrides,
+                )
+            )
+        for i, task in enumerate(asyncio.as_completed(calculation_futures)):
+            await task
+
+        start = time.perf_counter()
         with pytest.raises(ArbitrageError):
             await wbtc_weth_arb.calculate_with_pool(executor=executor)
 
@@ -2306,6 +2353,9 @@ async def test_process_pool_calculation(
             override_state=overrides,
         )
         result = await future
+
+        print(f"Calculated single pool result, {time.perf_counter()-start:.2f}s since start")
+
         assert result == ArbitrageCalculationResult(
             id="test_arb",
             input_token=weth_token,
@@ -2338,6 +2388,7 @@ async def test_process_pool_calculation(
                     override_state=overrides,
                 )
             )
+        print(f"Built futures, {time.perf_counter()-start:.2f}s since start")
 
         assert len(calculation_futures) == _NUM_FUTURES
         for i, task in enumerate(asyncio.as_completed(calculation_futures)):

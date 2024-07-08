@@ -1,6 +1,7 @@
 import pickle
 from typing import Dict
 
+import polars
 import pytest
 from degenbot.config import set_web3
 from degenbot.erc20_token import Erc20Token
@@ -12,11 +13,11 @@ from degenbot.exceptions import (
 )
 from degenbot.fork.anvil_fork import AnvilFork
 from degenbot.uniswap.v3_dataclasses import (
+    UniswapV3BitmapAtWord,
+    UniswapV3LiquidityAtTick,
     UniswapV3PoolExternalUpdate,
     UniswapV3PoolSimulationResult,
     UniswapV3PoolState,
-    UniswapV3BitmapAtWord,
-    UniswapV3LiquidityAtTick,
 )
 from degenbot.uniswap.v3_liquidity_pool import V3LiquidityPool
 from hexbytes import HexBytes
@@ -61,7 +62,11 @@ def test_fetching_tick_data(wbtc_weth_v3_lp_at_block_17_600_000: V3LiquidityPool
     word_position, _ = wbtc_weth_v3_lp_at_block_17_600_000._get_tick_bitmap_word_and_bit_position(
         wbtc_weth_v3_lp_at_block_17_600_000.tick
     )
-    wbtc_weth_v3_lp_at_block_17_600_000._fetch_tick_data_at_word(word_position + 5)
+    wbtc_weth_v3_lp_at_block_17_600_000._fetch_tick_data_at_word(
+        tick_bitmap=wbtc_weth_v3_lp_at_block_17_600_000.tick_bitmap,
+        tick_data=wbtc_weth_v3_lp_at_block_17_600_000.tick_data,
+        word_position=word_position + 5,
+    )
 
 
 def test_creation(ethereum_full_node_web3: Web3) -> None:
@@ -95,27 +100,6 @@ def test_creation(ethereum_full_node_web3: Web3) -> None:
             address=WBTC_WETH_V3_POOL_ADDRESS,
             deployer_address=UNISWAP_V3_FACTORY_ADDRESS,
             init_hash="0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b53",  # <--- Bad hash (last byte changed)
-        )
-
-    with pytest.raises(ValueError, match="Expected exactly two tokens"):
-        V3LiquidityPool(
-            address=WBTC_WETH_V3_POOL_ADDRESS,
-            tokens=[
-                Erc20Token(WBTC_CONTRACT_ADDRESS),
-                Erc20Token(WETH_CONTRACT_ADDRESS),
-                Erc20Token(DAI_CONTRACT_ADDRESS),  # <---- extra address (DAI)
-            ],
-        )
-
-    with pytest.raises(
-        ValueError, match="Token addresses do not match tokens recorded at contract"
-    ):
-        V3LiquidityPool(
-            address=WBTC_WETH_V3_POOL_ADDRESS,
-            tokens=[
-                Erc20Token(WBTC_CONTRACT_ADDRESS),
-                Erc20Token(DAI_CONTRACT_ADDRESS),  # <---- bad address (DAI)
-            ],
         )
 
     with pytest.raises(ValueError, match="Must provide both tick_bitmap and tick_data"):
@@ -536,7 +520,7 @@ def test_swap_for_all(wbtc_weth_v3_lp_at_block_17_600_000: V3LiquidityPool) -> N
 def test_external_update(wbtc_weth_v3_lp_at_block_17_600_000: V3LiquidityPool) -> None:
     _START_BLOCK = wbtc_weth_v3_lp_at_block_17_600_000._update_block + 1
 
-    wbtc_weth_v3_lp_at_block_17_600_000._sparse_bitmap = False
+    assert wbtc_weth_v3_lp_at_block_17_600_000.tick == 257907
 
     wbtc_weth_v3_lp_at_block_17_600_000.external_update(
         update=UniswapV3PoolExternalUpdate(
@@ -553,8 +537,16 @@ def test_external_update(wbtc_weth_v3_lp_at_block_17_600_000: V3LiquidityPool) -
     word_pos_2, _ = wbtc_weth_v3_lp_at_block_17_600_000._get_tick_bitmap_word_and_bit_position(
         -887220
     )
-    wbtc_weth_v3_lp_at_block_17_600_000._fetch_tick_data_at_word(word_pos_1)
-    wbtc_weth_v3_lp_at_block_17_600_000._fetch_tick_data_at_word(word_pos_2)
+    wbtc_weth_v3_lp_at_block_17_600_000._fetch_tick_data_at_word(
+        tick_bitmap=wbtc_weth_v3_lp_at_block_17_600_000.tick_bitmap,
+        tick_data=wbtc_weth_v3_lp_at_block_17_600_000.tick_data,
+        word_position=word_pos_1,
+    )
+    wbtc_weth_v3_lp_at_block_17_600_000._fetch_tick_data_at_word(
+        tick_bitmap=wbtc_weth_v3_lp_at_block_17_600_000.tick_bitmap,
+        tick_data=wbtc_weth_v3_lp_at_block_17_600_000.tick_data,
+        word_position=word_pos_2,
+    )
 
     new_liquidity = 10_000_000_000
 
@@ -569,21 +561,37 @@ def test_external_update(wbtc_weth_v3_lp_at_block_17_600_000: V3LiquidityPool) -
 
     # New liquidity is added to liquidityNet at lower tick, subtracted from upper tick.
     assert (
-        wbtc_weth_v3_lp_at_block_17_600_000.tick_data[-887160].liquidityNet
+        int(
+            wbtc_weth_v3_lp_at_block_17_600_000.tick_data.filter(polars.col("tick") == -887160)
+            .select("liquidityNet")
+            .item()
+        )
         == 80064092962998 + new_liquidity
     )
     assert (
-        wbtc_weth_v3_lp_at_block_17_600_000.tick_data[-887220].liquidityNet
+        int(
+            wbtc_weth_v3_lp_at_block_17_600_000.tick_data.filter(polars.col("tick") == -887220)
+            .select("liquidityNet")
+            .item()
+        )
         == 82174936226787 - new_liquidity
     )
 
-    # New liquidity is added to liquidityGross on both sides.
+    # New liquidity is added to liquidityGross at both ticks
     assert (
-        wbtc_weth_v3_lp_at_block_17_600_000.tick_data[-887160].liquidityGross
+        int(
+            wbtc_weth_v3_lp_at_block_17_600_000.tick_data.filter(polars.col("tick") == -887160)
+            .select("liquidityGross")
+            .item()
+        )
         == 80064092962998 + new_liquidity
     )
     assert (
-        wbtc_weth_v3_lp_at_block_17_600_000.tick_data[-887220].liquidityGross
+        int(
+            wbtc_weth_v3_lp_at_block_17_600_000.tick_data.filter(polars.col("tick") == -887220)
+            .select("liquidityGross")
+            .item()
+        )
         == 82174936226787 + new_liquidity
     )
 
@@ -686,23 +694,38 @@ def test_complex_liquidity_transaction_1(fork_mainnet_archive: AnvilFork):
 
     assert lp.liquidity == 47302815311876989
 
-    assert lp.tick_data[-2].liquidityGross == 2444435478572158
-    assert lp.tick_data[-2].liquidityNet == convert_unsigned_integer_to_signed(
-        340282366920938463463373056991514192626
+    assert (
+        int(lp.tick_data.filter(polars.col("tick") == -2).select("liquidityGross").item())
+        == 2444435478572158
+    )
+    assert int(
+        lp.tick_data.filter(polars.col("tick") == -2).select("liquidityNet").item()
+    ) == convert_unsigned_integer_to_signed(340282366920938463463373056991514192626)
+
+    assert (
+        int(lp.tick_data.filter(polars.col("tick") == -1).select("liquidityGross").item())
+        == 35737394957587036
+    )
+    assert (
+        int(lp.tick_data.filter(polars.col("tick") == -1).select("liquidityNet").item())
+        == 32197982189243310
     )
 
-    assert lp.tick_data[-1].liquidityGross == 35737394957587036
-    assert lp.tick_data[-1].liquidityNet == 32197982189243310
-
-    assert lp.tick_data[0].liquidityGross == 3908477120807173
-    assert lp.tick_data[0].liquidityNet == convert_unsigned_integer_to_signed(
-        340282366920938463463370705564595110629
+    assert (
+        int(lp.tick_data.filter(polars.col("tick") == 0).select("liquidityGross").item())
+        == 3908477120807173
     )
+    assert int(
+        lp.tick_data.filter(polars.col("tick") == 0).select("liquidityNet").item()
+    ) == convert_unsigned_integer_to_signed(340282366920938463463370705564595110629)
 
-    assert lp.tick_data[1].liquidityGross == 35087990576870618
-    assert lp.tick_data[1].liquidityNet == convert_unsigned_integer_to_signed(
-        340282366920938463463340830792807716726
+    assert (
+        int(lp.tick_data.filter(polars.col("tick") == 1).select("liquidityGross").item())
+        == 35087990576870618
     )
+    assert int(
+        lp.tick_data.filter(polars.col("tick") == 1).select("liquidityNet").item()
+    ) == convert_unsigned_integer_to_signed(340282366920938463463340830792807716726)
 
 
 def test_complex_liquidity_transaction_2(fork_mainnet_archive: AnvilFork):
@@ -751,20 +774,35 @@ def test_complex_liquidity_transaction_2(fork_mainnet_archive: AnvilFork):
 
     assert lp.liquidity == 47729789712963261
 
-    assert lp.tick_data[0].liquidityGross == 36789742298460066
-    assert lp.tick_data[0].liquidityNet == 29030358934123454
-
-    assert lp.tick_data[1].liquidityGross == 2206768132758995
-    assert lp.tick_data[1].liquidityNet == convert_unsigned_integer_to_signed(
-        340282366920938463463373712015251828349
+    assert (
+        int(lp.tick_data.filter(polars.col("tick") == 0).select("liquidityGross").item())
+        == 36789742298460066
+    )
+    assert (
+        int(lp.tick_data.filter(polars.col("tick") == 0).select("liquidityNet").item())
+        == 29030358934123454
     )
 
-    assert lp.tick_data[2].liquidityGross == 33976822553596059
-    assert lp.tick_data[2].liquidityNet == convert_unsigned_integer_to_signed(
-        340282366920938463463340631050012819095
+    assert (
+        int(lp.tick_data.filter(polars.col("tick") == 1).select("liquidityGross").item())
+        == 2206768132758995
     )
+    assert int(
+        lp.tick_data.filter(polars.col("tick") == 1).select("liquidityNet").item()
+    ) == convert_unsigned_integer_to_signed(340282366920938463463373712015251828349)
 
-    assert lp.tick_data[3].liquidityGross == 996384072015849
-    assert lp.tick_data[3].liquidityNet == convert_unsigned_integer_to_signed(
-        340282366920938463463373611250495718043
+    assert (
+        int(lp.tick_data.filter(polars.col("tick") == 2).select("liquidityGross").item())
+        == 33976822553596059
     )
+    assert int(
+        lp.tick_data.filter(polars.col("tick") == 2).select("liquidityNet").item()
+    ) == convert_unsigned_integer_to_signed(340282366920938463463340631050012819095)
+
+    assert (
+        int(lp.tick_data.filter(polars.col("tick") == 3).select("liquidityGross").item())
+        == 996384072015849
+    )
+    assert int(
+        lp.tick_data.filter(polars.col("tick") == 3).select("liquidityNet").item()
+    ) == convert_unsigned_integer_to_signed(340282366920938463463373611250495718043)

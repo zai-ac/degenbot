@@ -1,6 +1,7 @@
 import dataclasses
 from typing import Any, Dict, Tuple
 
+import polars
 from eth_typing import ChecksumAddress
 
 from ..baseclasses import BasePoolState, Message, UniswapSimulationResult
@@ -57,8 +58,8 @@ class UniswapV3PoolState(BasePoolState):
     liquidity: int
     sqrt_price_x96: int
     tick: int
-    tick_bitmap: Dict[int, UniswapV3BitmapAtWord] | None = dataclasses.field(default=None)
-    tick_data: Dict[int, UniswapV3LiquidityAtTick] | None = dataclasses.field(default=None)
+    tick_bitmap: polars.DataFrame | None = dataclasses.field(default=None)
+    tick_data: polars.DataFrame | None = dataclasses.field(default=None)
 
     def copy(self) -> "UniswapV3PoolState":
         return UniswapV3PoolState(
@@ -66,8 +67,8 @@ class UniswapV3PoolState(BasePoolState):
             liquidity=self.liquidity,
             sqrt_price_x96=self.sqrt_price_x96,
             tick=self.tick,
-            tick_bitmap=self.tick_bitmap.copy() if self.tick_bitmap is not None else None,
-            tick_data=self.tick_data.copy() if self.tick_data is not None else None,
+            tick_bitmap=self.tick_bitmap if self.tick_bitmap is not None else None,
+            tick_data=self.tick_data if self.tick_data is not None else None,
         )
 
 

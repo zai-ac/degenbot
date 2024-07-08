@@ -8,6 +8,7 @@ from fractions import Fraction
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 
+import polars
 import sqlmodel
 from eth_typing import ChecksumAddress
 from eth_utils.address import to_checksum_address
@@ -31,8 +32,6 @@ from ..manager.token_manager import Erc20TokenHelperManager
 from ..registry.all_pools import AllPools
 from .abi import UNISWAP_V3_POOL_ABI
 from .v3_dataclasses import (
-    UniswapV3BitmapAtWord,
-    UniswapV3LiquidityAtTick,
     UniswapV3PoolExternalUpdate,
     UniswapV3PoolSimulationResult,
     UniswapV3PoolState,
@@ -42,6 +41,31 @@ from .v3_functions import exchange_rate_from_sqrt_price_x96, generate_v3_pool_ad
 from .v3_libraries import LiquidityMath, SwapMath, TickBitmap, TickMath
 from .v3_libraries.functions import to_int256
 from .v3_tick_lens import TickLens
+
+TICK_DATA_SCHEMA = {
+    "tick": polars.Int32,
+    "liquidityNet": polars.String,  # Polars only supports up to 64-bit integers
+    "liquidityGross": polars.String,  # Polars only supports up to 64-bit integers
+}
+TICK_BITMAP_SCHEMA = {
+    "word": polars.Int16,
+    "bitmap": polars.String,  # Polars only supports up to 64-bit integers
+}
+EMPTY_TICK_DATA = polars.DataFrame(
+    data={
+        "tick": [],
+        "liquidityNet": [],
+        "liquidityGross": [],
+    },
+    schema=TICK_DATA_SCHEMA,
+)
+EMPTY_TICK_BITMAP = polars.DataFrame(
+    data={
+        "word": [],
+        "bitmap": [],
+    },
+    schema=TICK_BITMAP_SCHEMA,
+)
 
 
 class V3LiquidityPool(BaseLiquidityPool):
@@ -63,20 +87,20 @@ class V3LiquidityPool(BaseLiquidityPool):
     def __init__(
         self,
         address: str,
-        fee: int | None = None,
+        fee: int | None = None,  # TODO: add deprecation warning
         lens: TickLens | None = None,
-        tokens: List[Erc20Token] | None = None,
+        tokens: List[Erc20Token] | None = None,  # TODO: add deprecation warning
         name: str = "",
         update_method: str | None = None,
         abi: List[Any] | None = None,
-        factory_address: str | None = None,
+        factory_address: str | None = None,  # TODO: add deprecation warning
         factory_init_hash: str | None = None,
         deployer_address: str | None = None,
         init_hash: str | None = None,
         extra_words: int = 10,
         silent: bool = False,
-        tick_data: Dict[int, Dict[str, Any] | UniswapV3LiquidityAtTick] | None = None,
-        tick_bitmap: Dict[int, Dict[str, Any] | UniswapV3BitmapAtWord] | None = None,
+        tick_data: Dict[int, Dict[str, Any]] | polars.DataFrame | None = None,
+        tick_bitmap: Dict[int, Dict[str, Any]] | polars.DataFrame | None = None,
         state_block: int | None = None,
     ):
         self.address = to_checksum_address(address)
@@ -87,6 +111,22 @@ class V3LiquidityPool(BaseLiquidityPool):
 
         if state_block is None:
             state_block = w3.eth.block_number
+        self._update_block = state_block
+
+        self.state: UniswapV3PoolState = UniswapV3PoolState(
+            pool=self.address,
+            liquidity=0,
+            sqrt_price_x96=0,
+            tick=0,
+        )
+        self.liquidity = w3_contract.functions.liquidity().call(block_identifier=state_block)
+        self.sqrt_price_x96, self.tick, *_ = w3_contract.functions.slot0().call(
+            block_identifier=state_block
+        )
+
+        self._fee: int
+        self.factory: ChecksumAddress
+        self.deployer: ChecksumAddress | None
 
         with get_db_session() as session:
             selection = sqlmodel.select(UniswapV3LiquidityPoolData).where(
@@ -94,19 +134,6 @@ class V3LiquidityPool(BaseLiquidityPool):
                 UniswapV3LiquidityPoolData.chain_id == w3.eth.chain_id,
             )
             cached_pool_data = session.exec(selection).first()
-
-        self.state: UniswapV3PoolState = UniswapV3PoolState(
-            pool=self.address,
-            liquidity=0,
-            sqrt_price_x96=0,
-            tick=0,
-            tick_bitmap=dict(),
-            tick_data=dict(),
-        )
-
-        self._fee: int
-        self.factory: ChecksumAddress
-        self.deployer: ChecksumAddress | None
 
         if cached_pool_data:
             self.factory = to_checksum_address(cached_pool_data.factory)
@@ -140,8 +167,6 @@ class V3LiquidityPool(BaseLiquidityPool):
 
         # held for operations that manipulate state data
         self._state_lock = Lock()
-
-        self._update_block = state_block if state_block else w3.eth.get_block_number()
 
         self.init_hash: str | None = None
         if factory_init_hash is not None:
@@ -184,7 +209,9 @@ class V3LiquidityPool(BaseLiquidityPool):
             self._update_method = update_method
         self._extra_words = extra_words
 
-        # default to an empty, sparse bitmap with no tick data
+        # Default to an empty, sparse bitmap with no tick data
+        self.tick_data = EMPTY_TICK_DATA
+        self.tick_bitmap = EMPTY_TICK_BITMAP
         self._sparse_bitmap = True
 
         if (tick_bitmap is not None) != (tick_data is not None):
@@ -197,49 +224,48 @@ class V3LiquidityPool(BaseLiquidityPool):
             self._sparse_bitmap = False
 
         if tick_bitmap is not None:
-            # transform dict to UniswapV3BitmapAtWord
-            self.tick_bitmap = {
-                int(word): (
-                    UniswapV3BitmapAtWord(**bitmap_at_word)
-                    if not isinstance(
-                        bitmap_at_word,
-                        UniswapV3BitmapAtWord,
+            match tick_bitmap:
+                case polars.DataFrame():
+                    self.tick_bitmap = tick_bitmap
+                case dict():
+                    self.tick_bitmap = polars.DataFrame(
+                        data={
+                            "word": tick_bitmap.keys(),
+                            "bitmap": [str(value.bitmap) for value in tick_bitmap.values()],
+                        },
+                        schema=TICK_BITMAP_SCHEMA,
                     )
-                    else bitmap_at_word
-                )
-                for word, bitmap_at_word in tick_bitmap.items()
-            }
+                case _:
+                    raise ValueError("Unsupported tick_bitmap type")
 
         if tick_data is not None:
-            # transform dict to LiquidityAtTick
-            self.tick_data = {
-                int(tick): (
-                    UniswapV3LiquidityAtTick(**liquidity_at_tick)
-                    if not isinstance(
-                        liquidity_at_tick,
-                        UniswapV3LiquidityAtTick,
+            match tick_data:
+                case polars.DataFrame():
+                    self.tick_data = tick_data
+                case dict():
+                    self.tick_data = polars.DataFrame(
+                        data={
+                            "tick": tick_data.keys(),
+                            "liquidityNet": [
+                                str(value.liquidityNet) for value in tick_data.values()
+                            ],
+                            "liquidityGross": [
+                                str(value.liquidityGross) for value in tick_data.values()
+                            ],
+                        },
+                        schema=TICK_DATA_SCHEMA,
                     )
-                    else liquidity_at_tick
-                )
-                for tick, liquidity_at_tick in tick_data.items()
-            }
+                case _:
+                    raise ValueError("Unknown tick_data type")
 
         if tick_bitmap is None and tick_data is None:
-            logger.debug(f"{self} @ {self.address} updating -> {tick_bitmap=}, {tick_data=}")
             word_position, _ = self._get_tick_bitmap_word_and_bit_position(self.tick)
-
-            self._fetch_tick_data_at_word(
-                word_position,
+            self.tick_bitmap, self.tick_data = self._fetch_tick_data_at_word(
+                tick_bitmap=self.tick_bitmap,
+                tick_data=self.tick_data,
+                word_position=word_position,
                 block_number=self._update_block,
             )
-
-        self.liquidity = w3_contract.functions.liquidity().call(block_identifier=self._update_block)
-
-        (
-            self.sqrt_price_x96,
-            self.tick,
-            *_,
-        ) = w3_contract.functions.slot0().call(block_identifier=self._update_block)
 
         self._pool_state_archive: Dict[int, UniswapV3PoolState] = {
             0: UniswapV3PoolState(
@@ -278,20 +304,32 @@ class V3LiquidityPool(BaseLiquidityPool):
             logger.info(f"• Liquidity: {self.liquidity}")
             logger.info(f"• SqrtPrice: {self.sqrt_price_x96}")
             logger.info(f"• Tick: {self.tick}")
+            logger.info(f"• Tick Bitmap: {self.tick_bitmap}")
+            logger.info(f"• Tick Data: {self.tick_data}")
 
     def __getstate__(self) -> Dict[str, Any]:
         # Remove objects that cannot be pickled and are unnecessary to perform
         # the calculation
-        copied_attributes = (
-            "tick_bitmap",
-            "tick_data",
-        )
-
-        dropped_attributes = (
+        copied_attributes = ()
+        # dropped_attributes = (
+        #     "_state_lock",
+        #     "_subscribers",
+        #     "address",
+        #     "lens",
+        # )
+        dropped_attributes = [
+            "_extra_words",
+            "_pool_state_archive",
             "_state_lock",
             "_subscribers",
+            "_update_block",
+            "abi",
+            "deployer",
+            "factory",
+            "init_hash",
             "lens",
-        )
+            "name",
+        ]
 
         with self._state_lock:
             return {
@@ -409,25 +447,45 @@ class V3LiquidityPool(BaseLiquidityPool):
                     )
                 except BitmapWordUnavailableError as e:
                     missing_word = e.args[1]
+
                     if self._sparse_bitmap:
-                        logger.debug(f"(swap) {self.name} fetching word {missing_word}")
-                        self._fetch_tick_data_at_word(word_position=missing_word)
+                        logger.debug(f"Fetching missing word {missing_word}")
+                        _tick_bitmap, _tick_data = self._fetch_tick_data_at_word(
+                            tick_bitmap=_tick_bitmap,
+                            tick_data=_tick_data,
+                            word_position=missing_word,
+                        )
                     else:
-                        # bitmap is complete, so mark the word as empty
-                        # self.tick_bitmap[missing_word] = UniswapV3BitmapAtWord()
-                        _tick_bitmap[missing_word] = UniswapV3BitmapAtWord()
+                        # bitmap is complete, so mark word as empty
+                        _tick_bitmap = _tick_bitmap.update(
+                            other=polars.DataFrame(
+                                data={
+                                    "word": missing_word,
+                                    "bitmap": "0",
+                                },
+                                schema=_tick_bitmap.schema,
+                            ),
+                            left_on=["word"],
+                            right_on=["word"],
+                            how="full",
+                        )
+
                 else:
                     # nextInitializedTickWithinOneWord will search up to 256 ticks away, which may
                     # return a tick in an adjacent word if there are no initialized ticks in the current word.
                     # This word may not be known to the helper, so check and fetch the containing word for this tick
                     tick_next_word, _ = self._get_tick_bitmap_word_and_bit_position(step.tick_next)
 
-                    if self._sparse_bitmap and tick_next_word not in _tick_bitmap:
+                    if self._sparse_bitmap and tick_next_word not in _tick_bitmap["word"]:
                         logger.debug(
                             f"tickNext={step.tick_next} out of range! Fetching word={tick_next_word}"
                             f"\n{self.name}"
                         )
-                        self._fetch_tick_data_at_word(word_position=tick_next_word)
+                        _tick_bitmap, _tick_data = self._fetch_tick_data_at_word(
+                            tick_bitmap=_tick_bitmap,
+                            tick_data=_tick_data,
+                            word_position=tick_next_word,
+                        )
 
                     break
 
@@ -474,7 +532,11 @@ class V3LiquidityPool(BaseLiquidityPool):
                 # if the tick is initialized, run the tick transition
                 if step.initialized:
                     tick_next = step.tick_next
-                    liquidityNet = _tick_data[tick_next].liquidityNet
+                    liquidityNet = int(
+                        _tick_data.filter(polars.col("tick") == tick_next)
+                        .select("liquidityNet")
+                        .item()
+                    )
 
                     if zero_for_one:
                         liquidityNet = -liquidityNet
@@ -499,22 +561,27 @@ class V3LiquidityPool(BaseLiquidityPool):
             )
         )
 
-        return (
-            amount0,
-            amount1,
-            state.sqrt_price_x96,
-            state.liquidity,
-            state.tick,
-        )
+        # TODO: document this nonsense
+        if override_tick_bitmap is None:
+            self.tick_bitmap = _tick_bitmap
+        if override_tick_data is None:
+            self.tick_data = _tick_data
+
+        return amount0, amount1, state.sqrt_price_x96, state.liquidity, state.tick
 
     def _fetch_tick_data_at_word(
         self,
+        tick_bitmap: polars.DataFrame,
+        tick_data: polars.DataFrame,
         word_position: int,
         block_number: int | None = None,
-    ) -> None:
+    ) -> Tuple[polars.DataFrame, polars.DataFrame]:
         """
         Update the initialized tick values within a specified word position. A word is divided into
         256 ticks, spaced per the tickSpacing interval.
+
+        Polars DataFrames are immutable, so the inputs cannot be mutated in place. Calling code
+        must store the returned values.
         """
 
         _w3_contract = self._w3_contract
@@ -522,28 +589,50 @@ class V3LiquidityPool(BaseLiquidityPool):
         if block_number is None:
             block_number = config.get_web3().eth.get_block_number()
 
-        try:
+        # bugfix: handle case where the pool is not yet deployed at this block, so proceed with an
+        # empty bitmap and no tick data
+        if not config.get_web3().eth.get_code(self.address, block_identifier=block_number):
+            _tick_bitmap = 0
+            _tick_data = []
+        else:
             _tick_bitmap = _w3_contract.functions.tickBitmap(word_position).call(
                 block_identifier=block_number,
             )
             _tick_data = self.lens._w3_contract.functions.getPopulatedTicksInWord(
                 self.address, word_position
             ).call(block_identifier=block_number)
-        except Exception as e:
-            print(f"(V3LiquidityPool) (_update_tick_data_at_word) (single tick): {e}")
-            print(type(e))
-            raise
-        else:
-            self.tick_bitmap[word_position] = UniswapV3BitmapAtWord(
-                bitmap=_tick_bitmap,
-                block=block_number,
+
+        updated_word = polars.DataFrame(
+            data={
+                "word": word_position,
+                "bitmap": str(_tick_bitmap),
+            },
+            schema=tick_bitmap.schema,
+        )
+        tick_bitmap = tick_bitmap.update(
+            other=updated_word,
+            left_on=["word"],
+            right_on=["word"],
+            how="full",
+        )
+
+        for tick, liquidity_net, liquidity_gross in _tick_data:
+            updated_tick_data = polars.DataFrame(
+                data={
+                    "tick": tick,
+                    "liquidityNet": str(liquidity_net),
+                    "liquidityGross": str(liquidity_gross),
+                },
+                schema=tick_data.schema,
             )
-            for tick, liquidity_net, liquidity_gross in _tick_data:
-                self.tick_data[tick] = UniswapV3LiquidityAtTick(
-                    liquidityNet=liquidity_net,
-                    liquidityGross=liquidity_gross,
-                    block=block_number,
-                )
+            tick_data = tick_data.update(
+                other=updated_tick_data,
+                left_on=["tick"],
+                right_on=["tick"],
+                how="full",
+            )
+
+        return tick_bitmap, tick_data
 
     def _get_tick_bitmap_word_and_bit_position(self, tick: int) -> Tuple[int, int]:
         """
@@ -597,13 +686,13 @@ class V3LiquidityPool(BaseLiquidityPool):
         )
 
     @property
-    def tick_bitmap(self) -> Dict[int, UniswapV3BitmapAtWord]:
+    def tick_bitmap(self) -> polars.DataFrame:
         if TYPE_CHECKING:
             assert self.state.tick_bitmap is not None
         return self.state.tick_bitmap
 
     @tick_bitmap.setter
-    def tick_bitmap(self, new_tick_bitmap: Dict[int, UniswapV3BitmapAtWord]) -> None:
+    def tick_bitmap(self, new_tick_bitmap: polars.DataFrame) -> None:
         self.state = UniswapV3PoolState(
             pool=self.address,
             liquidity=self.liquidity,
@@ -614,13 +703,13 @@ class V3LiquidityPool(BaseLiquidityPool):
         )
 
     @property
-    def tick_data(self) -> Dict[int, UniswapV3LiquidityAtTick]:
+    def tick_data(self) -> polars.DataFrame:
         if TYPE_CHECKING:
             assert self.state.tick_data is not None
         return self.state.tick_data
 
     @tick_data.setter
-    def tick_data(self, new_tick_data: Dict[int, UniswapV3LiquidityAtTick]) -> None:
+    def tick_data(self, new_tick_data: polars.DataFrame) -> None:
         self.state = UniswapV3PoolState(
             pool=self.address,
             liquidity=self.liquidity,
@@ -728,8 +817,8 @@ class V3LiquidityPool(BaseLiquidityPool):
         if token_in not in self.tokens:  # pragma: no cover
             raise ValueError("token_in not found!")
 
-        if override_state:
-            logger.debug(f"V3 calc with overridden state: {override_state}")
+        # if override_state:
+        #     logger.debug(f"V3 calc with overridden state: {override_state}")
 
         _is_zero_for_one = token_in == self.token0
 
@@ -891,15 +980,13 @@ class V3LiquidityPool(BaseLiquidityPool):
                 for tick in (lower_tick, upper_tick):
                     tick_word, _ = self._get_tick_bitmap_word_and_bit_position(tick)
 
-                    if tick_word not in self.tick_bitmap:
-                        # The tick bitmap must be known for the word prior to changing the
-                        # initialized status of any tick
-
+                    # The tick bitmap must be known for the word prior to changing the initialized
+                    # status of any tick
+                    if tick_word not in self.tick_bitmap["word"]:
                         if self._sparse_bitmap:
-                            logger.debug(
-                                f"(external_update) {tick_word=} not found in tick_bitmap {self.tick_bitmap.keys()=}"
-                            )
-                            self._fetch_tick_data_at_word(
+                            self.tick_bitmap, self.tick_data = self._fetch_tick_data_at_word(
+                                tick_bitmap=self.tick_bitmap,
+                                tick_data=self.tick_data,
                                 word_position=tick_word,
                                 # Fetch the word using the previous block as a known "good" state snapshot
                                 block_number=update.block_number - 1,
@@ -907,19 +994,36 @@ class V3LiquidityPool(BaseLiquidityPool):
 
                         else:
                             # The bitmap is complete (sparse=False), so mark this word as empty
-                            self.tick_bitmap[tick_word] = UniswapV3BitmapAtWord()
+                            self.tick_bitmap = self.tick_bitmap.update(
+                                other=polars.DataFrame(
+                                    data={
+                                        "word": tick_word,
+                                        "bitmap": "0",
+                                    },
+                                    schema=self.tick_bitmap.schema,
+                                ),
+                                left_on=["word"],
+                                right_on=["word"],
+                                how="full",
+                            )
 
-                    # Get the liquidity info for this tick
-                    try:
-                        tick_liquidity_net, tick_liquidity_gross = (
-                            self.tick_data[tick].liquidityNet,
-                            self.tick_data[tick].liquidityGross,
+                    if tick in self.tick_data["tick"]:
+                        tick_liquidity_net = int(
+                            self.tick_data.filter(polars.col("tick") == tick)
+                            .select("liquidityNet")
+                            .item()
                         )
-                    except (KeyError, AttributeError):
+                        tick_liquidity_gross = int(
+                            self.tick_data.filter(polars.col("tick") == tick)
+                            .select("liquidityGross")
+                            .item()
+                        )
+
+                    else:
                         # if it doesn't exist, initialize the tick and set the current values to zero
                         tick_liquidity_net = 0
                         tick_liquidity_gross = 0
-                        TickBitmap.flipTick(
+                        self.tick_bitmap = TickBitmap.flipTick(
                             self.tick_bitmap,
                             tick,
                             self._tick_spacing,
@@ -937,20 +1041,28 @@ class V3LiquidityPool(BaseLiquidityPool):
                     new_liquidity_gross = tick_liquidity_gross + liquidity_delta
 
                     if new_liquidity_gross == 0:
-                        # Delete if there is no remaining liquidity referencing this tick, then
+                        # Delete tick there is no remaining liquidity referencing it, and
                         # flip it in the bitmap
-                        del self.tick_data[tick]
-                        TickBitmap.flipTick(
+                        self.tick_data = self.tick_data.filter(polars.col("tick") != tick)
+                        self.tick_bitmap = TickBitmap.flipTick(
                             self.tick_bitmap,
                             tick,
                             self._tick_spacing,
                             update_block=update.block_number,
                         )
                     else:
-                        self.tick_data[tick] = UniswapV3LiquidityAtTick(
-                            liquidityNet=new_liquidity_net,
-                            liquidityGross=new_liquidity_gross,
-                            block=update.block_number,
+                        self.tick_data = self.tick_data.update(
+                            other=polars.DataFrame(
+                                data={
+                                    "tick": tick,
+                                    "liquidityNet": str(new_liquidity_net),
+                                    "liquidityGross": str(new_liquidity_gross),
+                                },
+                                schema=self.tick_data.schema,
+                            ),
+                            left_on=["tick"],
+                            right_on=["tick"],
+                            how="full",
                         )
 
             if not silent:

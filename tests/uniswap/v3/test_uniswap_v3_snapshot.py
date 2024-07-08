@@ -1,13 +1,19 @@
+from typing import Dict
+
+import polars
 import pytest
 from degenbot.config import set_web3
 from degenbot.fork.anvil_fork import AnvilFork
 from degenbot.uniswap.managers import UniswapV3LiquidityPoolManager
-from degenbot.uniswap.v3_dataclasses import (
-    UniswapV3BitmapAtWord,
-    UniswapV3LiquidityAtTick,
-    UniswapV3LiquidityEvent,
+from degenbot.uniswap.v3_dataclasses import UniswapV3LiquidityEvent
+from degenbot.uniswap.v3_liquidity_pool import (
+    EMPTY_TICK_BITMAP,
+    EMPTY_TICK_DATA,
+    TICK_BITMAP_SCHEMA,
+    TICK_DATA_SCHEMA,
 )
 from degenbot.uniswap.v3_snapshot import UniswapV3LiquiditySnapshot
+from eth_typing import ChecksumAddress
 from eth_utils.address import to_checksum_address
 from web3 import Web3
 
@@ -157,26 +163,32 @@ def test_apply_update_to_snapshot(
 
     set_web3(fork_mainnet_archive.w3)
 
-    tick_data = {
-        253320: UniswapV3LiquidityAtTick(
-            liquidityNet=34399999543676, liquidityGross=34399999543676, block=12369821
-        ),
-        264600: UniswapV3LiquidityAtTick(
-            liquidityNet=-34399999543676, liquidityGross=34399999543676, block=12369821
-        ),
-        255540: UniswapV3LiquidityAtTick(
-            liquidityNet=2154941425, liquidityGross=2154941425, block=12369846
-        ),
-        262440: UniswapV3LiquidityAtTick(
-            liquidityNet=-2154941425, liquidityGross=2154941425, block=12369846
-        ),
-    }
-    tick_bitmap = {
-        16: UniswapV3BitmapAtWord(
-            bitmap=11692013098732293937359713277596107809105402396672, block=12369846
-        ),
-        17: UniswapV3BitmapAtWord(bitmap=288230376155906048, block=12369846),
-    }
+    tick_data = polars.DataFrame(
+        data={
+            "tick": [253320, 264600, 255540, 262440],
+            "liquidityNet": [
+                str(liq) for liq in [34399999543676, -34399999543676, 2154941425, -2154941425]
+            ],
+            "liquidityGross": [
+                str(liq) for liq in [34399999543676, 34399999543676, 2154941425, 2154941425]
+            ],
+        },
+        schema=TICK_DATA_SCHEMA,
+    )
+    tick_bitmap = polars.DataFrame(
+        data={
+            "word": [16, 17],
+            "bitmap": [
+                str(bitmap)
+                for bitmap in [
+                    11692013098732293937359713277596107809105402396672,
+                    288230376155906048,
+                ]
+            ],
+        },
+        schema=TICK_BITMAP_SCHEMA,
+    )
+
     empty_snapshot.update_snapshot(
         pool=POOL_ADDRESS,
         tick_data=tick_data,
@@ -197,8 +209,8 @@ def test_apply_update_to_snapshot(
         snapshot=empty_snapshot,
     )
     pool = pool_manager.get_pool(POOL_ADDRESS)
-    assert pool.tick_bitmap == tick_bitmap
-    assert pool.tick_data == tick_data
+    assert pool.tick_bitmap is tick_bitmap
+    assert pool.tick_data is tick_data
 
 
 def test_pool_manager_applies_snapshots(
@@ -214,133 +226,342 @@ def test_pool_manager_applies_snapshots(
         snapshot=first_250_blocks_snapshot,
     )
 
+    pool_creation_blocks: Dict[ChecksumAddress, int] = {
+        "0x1d42064Fc4Beb5F8aAF85F4617AE8b3b5B8Bd801": 12369739,
+        "0x6c6Bc977E13Df9b0de53b251522280BB72383700": 12369760,
+        "0x7BeA39867e4169DBe237d55C8242a8f2fcDcc387": 12369811,
+        "0xCBCdF9626bC03E24f779434178A73a0B4bad62eD": 12369821,
+        "0xC2e9F25Be6257c210d7Adf0D4Cd6E3E881ba25f8": 12369854,
+        "0x7858E59e0C01EA06Df3aF3D20aC7B0003275D4Bf": 12369863,
+    }
+
     # Check that the pending events were applied
     for pool_address in first_250_blocks_snapshot._liquidity_snapshot:
-        pool = pool_manager.get_pool(pool_address)
+        pool = pool_manager.get_pool(
+            pool_address,
+            state_block=pool_creation_blocks[pool_address],
+            v3liquiditypool_kwargs={"tick_bitmap": EMPTY_TICK_BITMAP, "tick_data": EMPTY_TICK_DATA},
+        )
 
         match pool.address:
             case "0x1d42064Fc4Beb5F8aAF85F4617AE8b3b5B8Bd801":
-                assert pool.tick_data == {
-                    -50580: UniswapV3LiquidityAtTick(
-                        liquidityNet=383995753785830744,
-                        liquidityGross=383995753785830744,
-                        block=12369739,
-                    ),
-                    -36720: UniswapV3LiquidityAtTick(
-                        liquidityNet=-383995753785830744,
-                        liquidityGross=383995753785830744,
-                        block=12369739,
-                    ),
-                }
-                assert pool.tick_bitmap == {
-                    -4: UniswapV3BitmapAtWord(
-                        bitmap=3064991081731777716716694054300618367237478244367204352,
-                        block=12369739,
-                    ),
-                    -3: UniswapV3BitmapAtWord(
-                        bitmap=91343852333181432387730302044767688728495783936, block=12369739
-                    ),
-                }
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -50580)
+                        .select("liquidityNet")
+                        .item()
+                    )
+                    == 383995753785830744
+                )
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -50580)
+                        .select("liquidityGross")
+                        .item()
+                    )
+                    == 383995753785830744
+                )
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -36720)
+                        .select("liquidityNet")
+                        .item()
+                    )
+                    == -383995753785830744
+                )
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -36720)
+                        .select("liquidityGross")
+                        .item()
+                    )
+                    == 383995753785830744
+                )
+
+                assert (
+                    int(pool.tick_bitmap.filter(polars.col("word") == -4).select("bitmap").item())
+                    == 3064991081731777716716694054300618367237478244367204352
+                )
+                assert (
+                    int(pool.tick_bitmap.filter(polars.col("word") == -3).select("bitmap").item())
+                    == 91343852333181432387730302044767688728495783936
+                )
+
             case "0x6c6Bc977E13Df9b0de53b251522280BB72383700":
-                assert pool.tick_data == {
-                    -276330: UniswapV3LiquidityAtTick(
-                        liquidityNet=3964498619038659,
-                        liquidityGross=3964498619038659,
-                        block=12369760,
-                    ),
-                    -276320: UniswapV3LiquidityAtTick(
-                        liquidityNet=-3964498619038659,
-                        liquidityGross=3964498619038659,
-                        block=12369760,
-                    ),
-                    -276400: UniswapV3LiquidityAtTick(
-                        liquidityNet=2698389804940873511,
-                        liquidityGross=2698389804940873511,
-                        block=12369823,
-                    ),
-                    -276250: UniswapV3LiquidityAtTick(
-                        liquidityNet=-2698389804940873511,
-                        liquidityGross=2698389804940873511,
-                        block=12369823,
-                    ),
-                }
-                assert pool.tick_bitmap == {
-                    -108: UniswapV3BitmapAtWord(bitmap=8487168, block=12369823)
-                }
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -276330)
+                        .select("liquidityNet")
+                        .item()
+                    )
+                    == 3964498619038659
+                )
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -276330)
+                        .select("liquidityGross")
+                        .item()
+                    )
+                    == 3964498619038659
+                )
+
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -276320)
+                        .select("liquidityNet")
+                        .item()
+                    )
+                    == -3964498619038659
+                )
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -276320)
+                        .select("liquidityGross")
+                        .item()
+                    )
+                    == 3964498619038659
+                )
+
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -276400)
+                        .select("liquidityNet")
+                        .item()
+                    )
+                    == 2698389804940873511
+                )
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -276400)
+                        .select("liquidityGross")
+                        .item()
+                    )
+                    == 2698389804940873511
+                )
+
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -276250)
+                        .select("liquidityNet")
+                        .item()
+                    )
+                    == -2698389804940873511
+                )
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -276250)
+                        .select("liquidityGross")
+                        .item()
+                    )
+                    == 2698389804940873511
+                )
+
+                assert (
+                    int(pool.tick_bitmap.filter(polars.col("word") == -108).select("bitmap").item())
+                    == 8487168
+                )
 
             case "0x7BeA39867e4169DBe237d55C8242a8f2fcDcc387":
-                assert pool.tick_data == {
-                    192200: UniswapV3LiquidityAtTick(
-                        liquidityNet=123809464957093, liquidityGross=123809464957093, block=12369811
-                    ),
-                    198000: UniswapV3LiquidityAtTick(
-                        liquidityNet=-123809464957093,
-                        liquidityGross=123809464957093,
-                        block=12369811,
-                    ),
-                }
-                assert pool.tick_bitmap == {
-                    3: UniswapV3BitmapAtWord(
-                        bitmap=6739986679341863419440115299426486514824618937839854009203971588096,
-                        block=12369811,
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == 192200)
+                        .select("liquidityNet")
+                        .item()
                     )
-                }
+                    == 123809464957093
+                )
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == 192200)
+                        .select("liquidityGross")
+                        .item()
+                    )
+                    == 123809464957093
+                )
+
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == 198000)
+                        .select("liquidityNet")
+                        .item()
+                    )
+                    == -123809464957093
+                )
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == 198000)
+                        .select("liquidityGross")
+                        .item()
+                    )
+                    == 123809464957093
+                )
+
+                assert (
+                    int(pool.tick_bitmap.filter(polars.col("word") == 3).select("bitmap").item())
+                    == 6739986679341863419440115299426486514824618937839854009203971588096
+                )
+
             case "0xCBCdF9626bC03E24f779434178A73a0B4bad62eD":
-                assert pool.tick_data == {
-                    253320: UniswapV3LiquidityAtTick(
-                        liquidityNet=34399999543676, liquidityGross=34399999543676, block=12369821
-                    ),
-                    264600: UniswapV3LiquidityAtTick(
-                        liquidityNet=-34399999543676, liquidityGross=34399999543676, block=12369821
-                    ),
-                    255540: UniswapV3LiquidityAtTick(
-                        liquidityNet=2154941425, liquidityGross=2154941425, block=12369846
-                    ),
-                    262440: UniswapV3LiquidityAtTick(
-                        liquidityNet=-2154941425, liquidityGross=2154941425, block=12369846
-                    ),
-                }
-                assert pool.tick_bitmap == {
-                    16: UniswapV3BitmapAtWord(
-                        bitmap=11692013098732293937359713277596107809105402396672, block=12369846
-                    ),
-                    17: UniswapV3BitmapAtWord(bitmap=288230376155906048, block=12369846),
-                }
-            case "0xC2e9F25Be6257c210d7Adf0D4Cd6E3E881ba25f8":
-                assert pool.tick_data == {
-                    -84120: UniswapV3LiquidityAtTick(
-                        liquidityNet=80059851033970806503,
-                        liquidityGross=80059851033970806503,
-                        block=12369854,
-                    ),
-                    -78240: UniswapV3LiquidityAtTick(
-                        liquidityNet=-80059851033970806503,
-                        liquidityGross=80059851033970806503,
-                        block=12369854,
-                    ),
-                }
-                assert pool.tick_bitmap == {
-                    -6: UniswapV3BitmapAtWord(
-                        bitmap=6901746346790563787434755862298803523934049033832042530038157389332480,
-                        block=12369854,
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == 253320)
+                        .select("liquidityNet")
+                        .item()
                     )
-                }
+                    == 34399999543676
+                )
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == 253320)
+                        .select("liquidityGross")
+                        .item()
+                    )
+                    == 34399999543676
+                )
+
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == 264600)
+                        .select("liquidityNet")
+                        .item()
+                    )
+                    == -34399999543676
+                )
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == 264600)
+                        .select("liquidityGross")
+                        .item()
+                    )
+                    == 34399999543676
+                )
+
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == 255540)
+                        .select("liquidityNet")
+                        .item()
+                    )
+                    == 2154941425
+                )
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == 255540)
+                        .select("liquidityGross")
+                        .item()
+                    )
+                    == 2154941425
+                )
+
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == 262440)
+                        .select("liquidityNet")
+                        .item()
+                    )
+                    == -2154941425
+                )
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == 262440)
+                        .select("liquidityGross")
+                        .item()
+                    )
+                    == 2154941425
+                )
+
+                assert (
+                    int(pool.tick_bitmap.filter(polars.col("word") == 16).select("bitmap").item())
+                    == 11692013098732293937359713277596107809105402396672
+                )
+                assert (
+                    int(pool.tick_bitmap.filter(polars.col("word") == 17).select("bitmap").item())
+                    == 288230376155906048
+                )
+
+            case "0xC2e9F25Be6257c210d7Adf0D4Cd6E3E881ba25f8":
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -84120)
+                        .select("liquidityNet")
+                        .item()
+                    )
+                    == 80059851033970806503
+                )
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -84120)
+                        .select("liquidityGross")
+                        .item()
+                    )
+                    == 80059851033970806503
+                )
+
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -78240)
+                        .select("liquidityNet")
+                        .item()
+                    )
+                    == -80059851033970806503
+                )
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -78240)
+                        .select("liquidityGross")
+                        .item()
+                    )
+                    == 80059851033970806503
+                )
+
+                assert (
+                    int(pool.tick_bitmap.filter(polars.col("word") == -6).select("bitmap").item())
+                    == 6901746346790563787434755862298803523934049033832042530038157389332480
+                )
+
             case "0x7858E59e0C01EA06Df3aF3D20aC7B0003275D4Bf":
-                assert pool.tick_data == {
-                    -10: UniswapV3LiquidityAtTick(
-                        liquidityNet=21206360421978, liquidityGross=21206360421978, block=12369863
-                    ),
-                    10: UniswapV3LiquidityAtTick(
-                        liquidityNet=-21206360421978, liquidityGross=21206360421978, block=12369863
-                    ),
-                }
-                assert pool.tick_bitmap == {
-                    -1: UniswapV3BitmapAtWord(
-                        bitmap=57896044618658097711785492504343953926634992332820282019728792003956564819968,
-                        block=12369863,
-                    ),
-                    0: UniswapV3BitmapAtWord(bitmap=2, block=12369863),
-                }
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -10)
+                        .select("liquidityNet")
+                        .item()
+                    )
+                    == 21206360421978
+                )
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == -10)
+                        .select("liquidityGross")
+                        .item()
+                    )
+                    == 21206360421978
+                )
+
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == 10)
+                        .select("liquidityNet")
+                        .item()
+                    )
+                    == -21206360421978
+                )
+                assert (
+                    int(
+                        pool.tick_data.filter(polars.col("tick") == 10)
+                        .select("liquidityGross")
+                        .item()
+                    )
+                    == 21206360421978
+                )
+
+                assert (
+                    int(pool.tick_bitmap.filter(polars.col("word") == -1).select("bitmap").item())
+                    == 57896044618658097711785492504343953926634992332820282019728792003956564819968
+                )
+                assert (
+                    int(pool.tick_bitmap.filter(polars.col("word") == 0).select("bitmap").item())
+                    == 2
+                )
 
     # Check that the injected events were removed from the queue
     for pool_address in first_250_blocks_snapshot._liquidity_events:

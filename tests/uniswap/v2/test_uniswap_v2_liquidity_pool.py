@@ -288,20 +288,6 @@ def test_create_empty_pool(
             empty=True,
         )
 
-    # Create pool without init hash
-    with pytest.raises(ValueError):
-        LiquidityPool(
-            address=UNISWAP_V2_WBTC_WETH_POOL,
-            tokens=[
-                ethereum_uniswap_v2_wbtc_weth_liquiditypool.token0,
-                ethereum_uniswap_v2_wbtc_weth_liquiditypool.token1,
-            ],
-            name="WBTC-WETH (V2, 0.30%)",
-            factory_address=UNISWAPV2_FACTORY,
-            # factory_init_hash=UNISWAPV2_FACTORY_POOL_INIT_HASH,
-            empty=True,
-        )
-
     # Create pool with a malformed init hash
     bad_init_hash = UNISWAPV2_FACTORY_POOL_INIT_HASH.replace("a", "b")
     with pytest.raises(

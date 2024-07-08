@@ -10,7 +10,7 @@ from ..baseclasses import BaseManager
 from ..constants import ZERO_ADDRESS
 from ..dex.uniswap import FACTORY_ADDRESSES, TICKLENS_ADDRESSES
 from ..erc20_token import Erc20Token
-from ..exceptions import ManagerError, PoolNotAssociated
+from ..exceptions import ManagerError, PoolNotAssociated, ExternalUpdateError
 from ..logging import logger
 from ..manager.token_manager import Erc20TokenHelperManager
 from ..registry.all_pools import AllPools
@@ -185,10 +185,14 @@ class UniswapV2LiquidityPoolManager(UniswapLiquidityPoolManager):
         silent: bool = False,
         update_method: str = "polling",
         state_block: int | None = None,
+        liquiditypool_kwargs: Dict[str, Any] | None = None,
     ) -> LiquidityPool:
         """
         Get the pool object from its address, or a tuple of token addresses
         """
+
+        if liquiditypool_kwargs is None:
+            liquiditypool_kwargs = dict()
 
         if token_addresses is not None:
             if len(token_addresses) != 2:
@@ -248,6 +252,7 @@ class UniswapV2LiquidityPoolManager(UniswapLiquidityPoolManager):
                 factory_address=self._factory_address,
                 factory_init_hash=self._factory_init_hash,
                 update_method=update_method,
+                **liquiditypool_kwargs,
             )
         except Exception as e:
             self._untracked_pools.add(
@@ -349,13 +354,14 @@ class UniswapV3LiquidityPoolManager(UniswapLiquidityPoolManager):
         if not self._snapshot:
             return
 
-        # Reset the update block to zero so liquidity updates are accepted
         starting_state_block = pool._update_block
-        pool._update_block = 0
 
         # Apply updates and restore the non-liquidity state at the update block
         for liquidity_update in self._snapshot.get_new_liquidity_updates(pool.address):
-            pool.external_update(liquidity_update)
+            try:
+                pool.external_update(liquidity_update)
+            except ExternalUpdateError as exc:
+                logger.info(f"{exc=}")
         pool.auto_update(block_number=starting_state_block)
 
     def get_pool(
@@ -395,7 +401,13 @@ class UniswapV3LiquidityPoolManager(UniswapLiquidityPoolManager):
                     self._untracked_pools.add(pool_address)
                     raise PoolNotAssociated(f"Pool {pool_address} is not associated with this DEX")
 
-            if self._snapshot:
+            if (
+                self._snapshot
+                # Auto-fills the bitmap and tick data from the snapshot unless those were
+                # specifically included with the call to get_pool
+                and "tick_bitmap" not in v3liquiditypool_kwargs
+                and "tick_data" not in v3liquiditypool_kwargs
+            ):
                 v3liquiditypool_kwargs.update(
                     {
                         "tick_bitmap": self._snapshot.get_tick_bitmap(pool_address),
@@ -403,9 +415,7 @@ class UniswapV3LiquidityPoolManager(UniswapLiquidityPoolManager):
                     }
                 )
             else:
-                logger.info(
-                    f"Initializing pool manager at address {self._factory_address} without liquidity snapshot"
-                )
+                logger.info("Initializing pool without liquidity snapshot.")
 
             # The pool is unknown, so build and add it
             try:

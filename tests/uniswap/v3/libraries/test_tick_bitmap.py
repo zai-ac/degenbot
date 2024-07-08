@@ -1,15 +1,13 @@
-from typing import Any, Dict
-
+import polars
 import pytest
 from degenbot.exceptions import EVMRevertError, MissingTickWordError
-from degenbot.uniswap.v3_dataclasses import UniswapV3BitmapAtWord
 from degenbot.uniswap.v3_libraries import TickBitmap, TickMath
 
 # Tests adapted from Typescript tests on Uniswap V3 Github repo
 # ref: https://github.com/Uniswap/v3-core/blob/main/test/TickBitmap.spec.ts
 
 
-def is_initialized(tick_bitmap: Dict[int, UniswapV3BitmapAtWord], tick: int) -> bool:
+def is_initialized(tick_bitmap: polars.DataFrame, tick: int) -> bool:
     # Adapted from Uniswap test contract
     # ref: https://github.com/Uniswap/v3-core/blob/main/contracts/test/TickBitmapTest.sol
 
@@ -17,70 +15,98 @@ def is_initialized(tick_bitmap: Dict[int, UniswapV3BitmapAtWord], tick: int) -> 
     return next == tick if initialized else False
 
 
-def empty_full_bitmap(spacing: int = 1) -> Dict[int, UniswapV3BitmapAtWord]:
+def empty_full_bitmap(spacing: int = 1) -> polars.DataFrame:
     """
     Generate a empty tick bitmap, maximum size, with the given tick spacing
     """
 
-    tick_bitmap = {}
-    for tick in range(TickMath.MIN_TICK, TickMath.MAX_TICK, spacing):
-        wordPos, _ = TickBitmap.position(tick=tick)
-        tick_bitmap[wordPos] = UniswapV3BitmapAtWord()
-    return tick_bitmap
+    return polars.DataFrame(
+        data={
+            "word": [
+                word
+                for word in range(
+                    TickBitmap.position(TickMath.MIN_TICK)[0],
+                    TickBitmap.position(TickMath.MAX_TICK)[0],
+                    spacing,
+                )
+            ],
+            "bitmap": [
+                "0"
+                for word in range(
+                    TickBitmap.position(TickMath.MIN_TICK)[0],
+                    TickBitmap.position(TickMath.MAX_TICK)[0],
+                    spacing,
+                )
+            ],
+        },
+        schema={
+            "word": polars.Int16,
+            "bitmap": polars.String,  # Polars only supports up to 64-bit integers
+        },
+    )
 
 
-def empty_sparse_bitmap() -> dict[int, Any]:
+def empty_sparse_bitmap() -> polars.DataFrame:
     """
     Generate a sparse, empty tick bitmap
     """
-    return dict()
+    return polars.DataFrame(
+        data={
+            "word": [],
+            "bitmap": [],
+        },
+        schema={
+            "word": polars.Int16,
+            "bitmap": polars.String,  # Polars only supports up to 64-bit integers
+        },
+    )
 
 
 def test_isInitialized():
     tick_bitmap = empty_full_bitmap()
+    assert is_initialized(tick_bitmap, tick=1) is False
 
-    assert is_initialized(tick_bitmap, 1) is False
+    tick_bitmap = TickBitmap.flipTick(tick_bitmap, tick=1, tick_spacing=1)
+    assert is_initialized(tick_bitmap, tick=1) is True
 
-    TickBitmap.flipTick(tick_bitmap, 1, tick_spacing=1)
-    assert is_initialized(tick_bitmap, 1) is True
+    # TODO: Investigate — the repo flips this tick twice, which may be a mistake
+    # tick_bitmap = TickBitmap.flipTick(tick_bitmap, tick=1, tick_spacing=1)
 
-    # TODO: The repo flips this tick twice, which may be a mistake
-    # TickBitmap.flipTick(tick_bitmap, 1, tick_spacing=1)
-    TickBitmap.flipTick(tick_bitmap, tick=1, tick_spacing=1)
-    assert is_initialized(tick_bitmap, 1) is False
+    tick_bitmap = TickBitmap.flipTick(tick_bitmap, tick=1, tick_spacing=1)
+    assert is_initialized(tick_bitmap, tick=1) is False
 
-    TickBitmap.flipTick(tick_bitmap, tick=2, tick_spacing=1)
-    assert is_initialized(tick_bitmap, 1) is False
+    tick_bitmap = TickBitmap.flipTick(tick_bitmap, tick=2, tick_spacing=1)
+    assert is_initialized(tick_bitmap, tick=1) is False
 
-    TickBitmap.flipTick(tick_bitmap, tick=1 + 256, tick_spacing=1)
-    assert is_initialized(tick_bitmap, 257) is True
-    assert is_initialized(tick_bitmap, 1) is False
+    tick_bitmap = TickBitmap.flipTick(tick_bitmap, tick=1 + 256, tick_spacing=1)
+    assert is_initialized(tick_bitmap, tick=257) is True
+    assert is_initialized(tick_bitmap, tick=1) is False
 
 
 def test_flipTick() -> None:
     tick_bitmap = empty_full_bitmap()
 
-    TickBitmap.flipTick(tick_bitmap, tick=-230, tick_spacing=1)
+    tick_bitmap = TickBitmap.flipTick(tick_bitmap, tick=-230, tick_spacing=1)
     assert is_initialized(tick_bitmap, -230) is True
     assert is_initialized(tick_bitmap, -231) is False
     assert is_initialized(tick_bitmap, -229) is False
     assert is_initialized(tick_bitmap, -230 + 256) is False
     assert is_initialized(tick_bitmap, -230 - 256) is False
 
-    TickBitmap.flipTick(tick_bitmap, tick=-230, tick_spacing=1)
+    tick_bitmap = TickBitmap.flipTick(tick_bitmap, tick=-230, tick_spacing=1)
     assert is_initialized(tick_bitmap, -230) is False
     assert is_initialized(tick_bitmap, -231) is False
     assert is_initialized(tick_bitmap, -229) is False
     assert is_initialized(tick_bitmap, -230 + 256) is False
     assert is_initialized(tick_bitmap, -230 - 256) is False
 
-    TickBitmap.flipTick(tick_bitmap, tick=-230, tick_spacing=1)
-    TickBitmap.flipTick(tick_bitmap, tick=-259, tick_spacing=1)
-    TickBitmap.flipTick(tick_bitmap, tick=-229, tick_spacing=1)
-    TickBitmap.flipTick(tick_bitmap, tick=500, tick_spacing=1)
-    TickBitmap.flipTick(tick_bitmap, tick=-259, tick_spacing=1)
-    TickBitmap.flipTick(tick_bitmap, tick=-229, tick_spacing=1)
-    TickBitmap.flipTick(tick_bitmap, tick=-259, tick_spacing=1)
+    tick_bitmap = TickBitmap.flipTick(tick_bitmap, tick=-230, tick_spacing=1)
+    tick_bitmap = TickBitmap.flipTick(tick_bitmap, tick=-259, tick_spacing=1)
+    tick_bitmap = TickBitmap.flipTick(tick_bitmap, tick=-229, tick_spacing=1)
+    tick_bitmap = TickBitmap.flipTick(tick_bitmap, tick=500, tick_spacing=1)
+    tick_bitmap = TickBitmap.flipTick(tick_bitmap, tick=-259, tick_spacing=1)
+    tick_bitmap = TickBitmap.flipTick(tick_bitmap, tick=-229, tick_spacing=1)
+    tick_bitmap = TickBitmap.flipTick(tick_bitmap, tick=-259, tick_spacing=1)
 
     assert is_initialized(tick_bitmap, -259) is True
     assert is_initialized(tick_bitmap, -229) is False
@@ -100,17 +126,11 @@ def test_incorrect_tick_spacing_flip() -> None:
 
 
 def test_nextInitializedTickWithinOneWord() -> None:
-    tick_bitmap: Dict[int, UniswapV3BitmapAtWord] = {}
-
-    # set up a full-sized empty tick bitmap
-    for tick in range(TickMath.MIN_TICK, TickMath.MAX_TICK):
-        wordPos, _ = TickBitmap.position(tick=tick)
-        if not tick_bitmap.get(wordPos):
-            tick_bitmap[wordPos] = UniswapV3BitmapAtWord()
+    tick_bitmap = empty_full_bitmap()
 
     # set the specified ticks to initialized
     for tick in [-200, -55, -4, 70, 78, 84, 139, 240, 535]:
-        TickBitmap.flipTick(tick_bitmap=tick_bitmap, tick=tick, tick_spacing=1)
+        tick_bitmap = TickBitmap.flipTick(tick_bitmap=tick_bitmap, tick=tick, tick_spacing=1)
 
     # lte = false tests
 

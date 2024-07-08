@@ -4,6 +4,7 @@
 from io import TextIOWrapper
 from typing import Any, Dict, List, TextIO, Tuple
 
+import polars
 import ujson
 from eth_typing import ChecksumAddress
 from eth_utils.address import to_checksum_address
@@ -14,11 +15,12 @@ from web3._utils.filters import construct_event_filter_params
 from .. import config
 from ..logging import logger
 from .abi import UNISWAP_V3_POOL_ABI
-from .v3_dataclasses import (
-    UniswapV3BitmapAtWord,
-    UniswapV3LiquidityAtTick,
-    UniswapV3LiquidityEvent,
-    UniswapV3PoolExternalUpdate,
+from .v3_dataclasses import UniswapV3LiquidityEvent, UniswapV3PoolExternalUpdate
+from .v3_liquidity_pool import (
+    TICK_BITMAP_SCHEMA,
+    TICK_DATA_SCHEMA,
+    EMPTY_TICK_DATA,
+    EMPTY_TICK_BITMAP,
 )
 
 
@@ -49,16 +51,38 @@ class UniswapV3LiquiditySnapshot:
 
         self.newest_block = json_liquidity_snapshot.pop("snapshot_block")
 
-        self._liquidity_snapshot: Dict[ChecksumAddress, Dict[str, Any]] = {
+        self._liquidity_snapshot: Dict[ChecksumAddress, polars.DataFrame] = {
             to_checksum_address(pool_address): {
-                "tick_bitmap": {
-                    int(k): UniswapV3BitmapAtWord(**v)
-                    for k, v in pool_liquidity_snapshot["tick_bitmap"].items()
-                },
-                "tick_data": {
-                    int(k): UniswapV3LiquidityAtTick(**v)
-                    for k, v in pool_liquidity_snapshot["tick_data"].items()
-                },
+                "tick_bitmap": polars.DataFrame(
+                    data={
+                        "word": [
+                            int(word)
+                            for word, pool_bitmaps in pool_liquidity_snapshot["tick_bitmap"].items()
+                        ],
+                        "bitmap": [
+                            str(pool_bitmaps["bitmap"])
+                            for word, pool_bitmaps in pool_liquidity_snapshot["tick_bitmap"].items()
+                        ],
+                    },
+                    schema=TICK_BITMAP_SCHEMA,
+                ),
+                "tick_data": polars.DataFrame(
+                    data={
+                        "tick": [
+                            int(tick)
+                            for tick, pool_tick_data in pool_liquidity_snapshot["tick_data"].items()
+                        ],
+                        "liquidityNet": [
+                            str(pool_tick_data["liquidityNet"])
+                            for tick, pool_tick_data in pool_liquidity_snapshot["tick_data"].items()
+                        ],
+                        "liquidityGross": [
+                            str(pool_tick_data["liquidityGross"])
+                            for tick, pool_tick_data in pool_liquidity_snapshot["tick_data"].items()
+                        ],
+                    },
+                    schema=TICK_DATA_SCHEMA,
+                ),
             }
             for pool_address, pool_liquidity_snapshot in json_liquidity_snapshot.items()
         }
@@ -167,33 +191,29 @@ class UniswapV3LiquiditySnapshot:
             for event in sorted_events
         ]
 
-    def get_tick_bitmap(self, pool: ChecksumAddress | str) -> Dict[int, UniswapV3BitmapAtWord]:
+    def get_tick_bitmap(self, pool: ChecksumAddress | str) -> polars.DataFrame:
         pool_address = to_checksum_address(pool)
 
         try:
-            tick_bitmap: Dict[int, UniswapV3BitmapAtWord] = self._liquidity_snapshot[pool_address][
-                "tick_bitmap"
-            ]
-            return tick_bitmap
+            return self._liquidity_snapshot[pool_address]["tick_bitmap"]
         except KeyError:
-            return dict()
+            # Assume the snapshot is complete and the pool has no initialized ticks
+            return EMPTY_TICK_BITMAP
 
-    def get_tick_data(self, pool: ChecksumAddress | str) -> Dict[int, UniswapV3LiquidityAtTick]:
+    def get_tick_data(self, pool: ChecksumAddress | str) -> polars.DataFrame:
         pool_address = to_checksum_address(pool)
 
         try:
-            tick_data: Dict[int, UniswapV3LiquidityAtTick] = self._liquidity_snapshot[pool_address][
-                "tick_data"
-            ]
-            return tick_data
+            return self._liquidity_snapshot[pool_address]["tick_data"]
         except KeyError:
-            return {}
+            # Assume the snapshot is complete and the pool has no initialized ticks
+            return EMPTY_TICK_DATA
 
     def update_snapshot(
         self,
         pool: ChecksumAddress | str,
-        tick_data: Dict[int, UniswapV3LiquidityAtTick],
-        tick_bitmap: Dict[int, UniswapV3BitmapAtWord],
+        tick_data: polars.DataFrame,
+        tick_bitmap: polars.DataFrame,
     ) -> None:
         pool_address = to_checksum_address(pool)
 

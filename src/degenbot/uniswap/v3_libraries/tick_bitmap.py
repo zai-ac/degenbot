@@ -1,33 +1,47 @@
 from decimal import Decimal
-from typing import Dict, Tuple
+from typing import Tuple
+
+import polars
 
 from ...constants import MAX_UINT8
 from ...exceptions import BitmapWordUnavailableError, EVMRevertError, MissingTickWordError
 from ...logging import logger
-from ..v3_dataclasses import UniswapV3BitmapAtWord
 from . import bit_math as BitMath
 
 
 def flipTick(
-    tick_bitmap: Dict[int, "UniswapV3BitmapAtWord"],
+    tick_bitmap: polars.DataFrame,
     tick: int,
     tick_spacing: int,
-    update_block: int | None = None,
-) -> None:
+    update_block: int | None = None,  # TODO: add deprecation warning
+) -> polars.DataFrame:
     if not (tick % tick_spacing == 0):
         raise EVMRevertError("Tick not correctly spaced!")
 
     word_pos, bit_pos = position(int(Decimal(tick) // tick_spacing))
+    if word_pos not in tick_bitmap["word"]:
+        raise MissingTickWordError(f"Called flipTick on missing word={word_pos}")
+
     logger.debug(f"Flipping {tick=} @ {word_pos=}, {bit_pos=}")
 
-    try:
-        mask = 1 << bit_pos
-        tick_bitmap[word_pos].bitmap ^= mask
-        tick_bitmap[word_pos].block = update_block
-    except KeyError:
-        raise MissingTickWordError(f"Called flipTick on missing word={word_pos}")
-    else:
-        logger.debug(f"Flipped {tick=} @ {word_pos=}, {bit_pos=}")
+    mask = 1 << bit_pos
+    bitmap_at_word = int(tick_bitmap.filter(polars.col("word") == word_pos).select("bitmap").item())
+
+    updated_word = polars.DataFrame(
+        data={
+            "word": word_pos,
+            "bitmap": str(bitmap_at_word ^ mask),
+        },
+        schema=tick_bitmap.schema,
+    )
+    logger.debug(f"Flipped {tick=} @ {word_pos=}, {bit_pos=}")
+
+    return tick_bitmap.update(
+        other=updated_word,
+        left_on=["word"],
+        right_on=["word"],
+        how="full",
+    )
 
 
 def position(tick: int) -> Tuple[int, int]:
@@ -37,7 +51,7 @@ def position(tick: int) -> Tuple[int, int]:
 
 
 def nextInitializedTickWithinOneWord(
-    tick_bitmap: Dict[int, "UniswapV3BitmapAtWord"],
+    tick_bitmap: polars.DataFrame,
     tick: int,
     tick_spacing: int,
     less_than_or_equal: bool,
@@ -50,11 +64,12 @@ def nextInitializedTickWithinOneWord(
 
     if less_than_or_equal:
         word_pos, bit_pos = position(compressed)
-
-        try:
-            bitmap_at_word = tick_bitmap[word_pos].bitmap
-        except KeyError:
+        if word_pos not in tick_bitmap["word"]:
             raise BitmapWordUnavailableError(f"Bitmap at word {word_pos} unavailable.", word_pos)
+
+        bitmap_at_word = int(
+            tick_bitmap.filter(polars.col("word") == word_pos).select("bitmap").item()
+        )
 
         # all the 1s at or to the right of the current bitPos
         mask = 2 * (1 << bit_pos) - 1
@@ -71,11 +86,12 @@ def nextInitializedTickWithinOneWord(
     else:
         # start from the word of the next tick, since the current tick state doesn't matter
         word_pos, bit_pos = position(compressed + 1)
-
-        try:
-            bitmap_at_word = tick_bitmap[word_pos].bitmap
-        except KeyError:
+        if word_pos not in tick_bitmap["word"]:
             raise BitmapWordUnavailableError(f"Bitmap at word {word_pos} unavailable.", word_pos)
+
+        bitmap_at_word = int(
+            tick_bitmap.filter(polars.col("word") == word_pos).select("bitmap").item()
+        )
 
         # all the 1s at or to the left of the bitPos
         mask = ~((1 << bit_pos) - 1)

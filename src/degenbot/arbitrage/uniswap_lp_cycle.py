@@ -107,7 +107,12 @@ class UniswapLpCycle(Subscriber, BaseArbitrage):
         self._subscribers: Set[Subscriber] = set()
 
     def __getstate__(self) -> Dict[str, Any]:
-        dropped_attributes = ("_subscribers",)
+        dropped_attributes = (
+            "_input_token",
+            "_subscribers",
+            "best",
+            "name",
+        )
         copied_attributes = ()
 
         return {
@@ -142,10 +147,10 @@ class UniswapLpCycle(Subscriber, BaseArbitrage):
         for pool, override in overrides:
             match override:
                 case UniswapV2PoolState() | UniswapV3PoolState():
-                    logger.debug(f"Applying override {override} to {pool}")
+                    # logger.debug(f"Applying override {override} to {pool}")
                     sorted_overrides[pool.address] = override
                 case UniswapV2PoolSimulationResult() | UniswapV3PoolSimulationResult():
-                    logger.debug(f"Applying override {override.final_state} to {pool}")
+                    # logger.debug(f"Applying override {override.final_state} to {pool}")
                     sorted_overrides[pool.address] = override.final_state
                 case _:  # pragma: no cover
                     raise ValueError(f"Override for {pool} has unsupported type {type(override)}")
@@ -289,11 +294,11 @@ class UniswapLpCycle(Subscriber, BaseArbitrage):
                     f"V3 pool {pool.address} has no liquidity (not initialized)"
                 )
 
-            if pool_state.tick_bitmap == {}:
+            if pool_state.tick_bitmap is not None and pool_state.tick_bitmap.is_empty():
                 # TODO: add housekeeping to `V3LiquidityPool` to remove tick_bitmaps set to 0
                 raise ZeroLiquidityError(f"V3 pool {pool.address} has no liquidity (empty bitmap)")
 
-            if pool_state.tick_data == {}:
+            if pool_state.tick_data is not None and pool_state.tick_data.is_empty():
                 raise ZeroLiquidityError(
                     f"V3 pool {pool.address} has no liquidity (no initialized ticks)"
                 )
