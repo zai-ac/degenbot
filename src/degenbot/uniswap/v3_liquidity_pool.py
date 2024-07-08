@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 
 import polars
 import sqlmodel
-import sqlmodel
 from eth_typing import ChecksumAddress
 from eth_utils.address import to_checksum_address
 from web3.contract.contract import Contract
@@ -113,6 +112,22 @@ class V3LiquidityPool(BaseLiquidityPool):
 
         if state_block is None:
             state_block = w3.eth.block_number
+        self._update_block = state_block
+
+        self.state: UniswapV3PoolState = UniswapV3PoolState(
+            pool=self.address,
+            liquidity=0,
+            sqrt_price_x96=0,
+            tick=0,
+        )
+        self.liquidity = w3_contract.functions.liquidity().call(block_identifier=state_block)
+        self.sqrt_price_x96, self.tick, *_ = w3_contract.functions.slot0().call(
+            block_identifier=state_block
+        )
+
+        self._fee: int
+        self.factory: ChecksumAddress
+        self.deployer: ChecksumAddress | None
 
         with get_db_session() as session:
             selection = sqlmodel.select(UniswapV3LiquidityPoolData).where(
@@ -120,19 +135,6 @@ class V3LiquidityPool(BaseLiquidityPool):
                 UniswapV3LiquidityPoolData.chain_id == w3.eth.chain_id,
             )
             cached_pool_data = session.exec(selection).first()
-
-        self.state: UniswapV3PoolState = UniswapV3PoolState(
-            pool=self.address,
-            liquidity=0,
-            sqrt_price_x96=0,
-            tick=0,
-            tick_bitmap=dict(),
-            tick_data=dict(),
-        )
-
-        self._fee: int
-        self.factory: ChecksumAddress
-        self.deployer: ChecksumAddress | None
 
         if cached_pool_data:
             self.factory = to_checksum_address(cached_pool_data.factory)
@@ -179,8 +181,6 @@ class V3LiquidityPool(BaseLiquidityPool):
 
         # held for operations that manipulate state data
         self._state_lock = Lock()
-
-        self._update_block = state_block if state_block else w3.eth.get_block_number()
 
         self.init_hash: str | None = None
         if factory_init_hash is not None:  # pragma: no cover
@@ -280,14 +280,6 @@ class V3LiquidityPool(BaseLiquidityPool):
                 word_position=word_position,
                 block_number=self._update_block,
             )
-
-        self.liquidity = w3_contract.functions.liquidity().call(block_identifier=self._update_block)
-
-        (
-            self.sqrt_price_x96,
-            self.tick,
-            *_,
-        ) = w3_contract.functions.slot0().call(block_identifier=self._update_block)
 
         self._pool_state_archive: Dict[int, UniswapV3PoolState] = {
             0: UniswapV3PoolState(
