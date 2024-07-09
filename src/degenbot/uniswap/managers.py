@@ -408,12 +408,13 @@ class UniswapV3LiquidityPoolManager(UniswapLiquidityPoolManager):
                 and "tick_bitmap" not in v3liquiditypool_kwargs
                 and "tick_data" not in v3liquiditypool_kwargs
             ):
-                v3liquiditypool_kwargs.update(
-                    {
-                        "tick_bitmap": self._snapshot.get_tick_bitmap(pool_address),
-                        "tick_data": self._snapshot.get_tick_data(pool_address),
-                    }
-                )
+                tick_bitmap = self._snapshot.get_tick_bitmap(pool_address)
+                if tick_bitmap is not None and not tick_bitmap.is_empty():
+                    v3liquiditypool_kwargs["tick_bitmap"] = tick_bitmap
+
+                tick_data = self._snapshot.get_tick_data(pool_address)
+                if tick_data is not None and not tick_data.is_empty():
+                    v3liquiditypool_kwargs["tick_data"] = tick_data
             else:
                 logger.info("Initializing pool without liquidity snapshot.")
 

@@ -55,14 +55,20 @@ def test_fetch_liquidity_events_first_250_blocks(
 
     # Liquidity snapshots for each pool will be empty, since they only reflect the starting
     # liquidity at the initial snapshot block
-    assert first_250_blocks_snapshot._liquidity_snapshot == {
-        "0x1d42064Fc4Beb5F8aAF85F4617AE8b3b5B8Bd801": {},
-        "0x6c6Bc977E13Df9b0de53b251522280BB72383700": {},
-        "0x7BeA39867e4169DBe237d55C8242a8f2fcDcc387": {},
-        "0xCBCdF9626bC03E24f779434178A73a0B4bad62eD": {},
-        "0xC2e9F25Be6257c210d7Adf0D4Cd6E3E881ba25f8": {},
-        "0x7858E59e0C01EA06Df3aF3D20aC7B0003275D4Bf": {},
-    }
+    for pool_address in [
+        "0x6c6Bc977E13Df9b0de53b251522280BB72383700",
+        "0x7BeA39867e4169DBe237d55C8242a8f2fcDcc387",
+        "0xCBCdF9626bC03E24f779434178A73a0B4bad62eD",
+        "0xC2e9F25Be6257c210d7Adf0D4Cd6E3E881ba25f8",
+        "0x7858E59e0C01EA06Df3aF3D20aC7B0003275D4Bf",
+    ]:
+        pool_address = to_checksum_address(pool_address)
+        assert first_250_blocks_snapshot._liquidity_snapshot[pool_address]["tick_bitmap"].equals(
+            EMPTY_TICK_BITMAP
+        )
+        assert first_250_blocks_snapshot._liquidity_snapshot[pool_address]["tick_data"].equals(
+            EMPTY_TICK_DATA
+        )
 
     # Unprocessed events should be found for these pools
     assert first_250_blocks_snapshot._liquidity_events == {
@@ -161,6 +167,8 @@ def test_apply_update_to_snapshot(
 ):
     POOL_ADDRESS = "0xCBCdF9626bC03E24f779434178A73a0B4bad62eD"
 
+    working_snapshot = empty_snapshot
+
     set_web3(fork_mainnet_archive.w3)
 
     tick_data = polars.DataFrame(
@@ -189,28 +197,30 @@ def test_apply_update_to_snapshot(
         schema=TICK_BITMAP_SCHEMA,
     )
 
-    empty_snapshot.update_snapshot(
+    # Test that the snapshot stores and returns the specified tick data and bitmap
+    working_snapshot.update_snapshot(
         pool=POOL_ADDRESS,
         tick_data=tick_data,
         tick_bitmap=tick_bitmap,
     )
-    empty_snapshot.update_snapshot(
-        pool=POOL_ADDRESS,
-        tick_data=tick_data,
-        tick_bitmap=tick_bitmap,
-    )
+    _tick_data = working_snapshot.get_tick_data(POOL_ADDRESS)
+    assert _tick_data is not None
+    assert _tick_data.equals(tick_data)
 
-    assert empty_snapshot.get_tick_data(POOL_ADDRESS) is tick_data
-    assert empty_snapshot.get_tick_bitmap(POOL_ADDRESS) is tick_bitmap
+    _tick_bitmap = working_snapshot.get_tick_bitmap(POOL_ADDRESS)
+    assert _tick_bitmap is not None
+    assert _tick_bitmap.equals(tick_bitmap)
 
+    # Test that the pool manager injects the tick data and bitmap from the snapshot when building
+    # a pool
     pool_manager = UniswapV3LiquidityPoolManager(
         factory_address="0x1F98431c8aD98523631AE4a59f267346ea31F984",
         chain_id=1,
-        snapshot=empty_snapshot,
+        snapshot=working_snapshot,
     )
     pool = pool_manager.get_pool(POOL_ADDRESS)
-    assert pool.tick_bitmap is tick_bitmap
-    assert pool.tick_data is tick_data
+    assert pool.tick_bitmap.equals(tick_bitmap)
+    assert pool.tick_data.equals(tick_data)
 
 
 def test_pool_manager_applies_snapshots(
@@ -226,7 +236,7 @@ def test_pool_manager_applies_snapshots(
         snapshot=first_250_blocks_snapshot,
     )
 
-    pool_creation_blocks: Dict[ChecksumAddress, int] = {
+    pool_creation_blocks: Dict[str, int] = {
         "0x1d42064Fc4Beb5F8aAF85F4617AE8b3b5B8Bd801": 12369739,
         "0x6c6Bc977E13Df9b0de53b251522280BB72383700": 12369760,
         "0x7BeA39867e4169DBe237d55C8242a8f2fcDcc387": 12369811,

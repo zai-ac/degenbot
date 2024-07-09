@@ -6,7 +6,7 @@ from bisect import bisect_left
 from decimal import Decimal
 from fractions import Fraction
 from threading import Lock
-from typing import TYPE_CHECKING, Any, Dict, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Mapping, cast
 
 import polars
 import sqlmodel
@@ -16,7 +16,6 @@ from web3.contract.contract import Contract
 
 from .. import config
 from ..baseclasses import BaseLiquidityPool
-from ..cache.database import UniswapV3LiquidityPoolData, get_db_session
 from ..cache.database import UniswapV3LiquidityPoolData, get_db_session
 from ..dex.uniswap import TICKLENS_ADDRESSES
 from ..erc20_token import Erc20Token
@@ -33,6 +32,8 @@ from ..manager.token_manager import Erc20TokenHelperManager
 from ..registry.all_pools import AllPools
 from .abi import UNISWAP_V3_POOL_ABI
 from .v3_dataclasses import (
+    UniswapV3BitmapAtWord,
+    UniswapV3LiquidityAtTick,
     UniswapV3PoolExternalUpdate,
     UniswapV3PoolSimulationResult,
     UniswapV3PoolState,
@@ -100,8 +101,14 @@ class V3LiquidityPool(BaseLiquidityPool):
         init_hash: str | None = None,
         extra_words: int = 10,
         silent: bool = False,
-        tick_data: Dict[int, Dict[str, Any]] | polars.DataFrame | None = None,
-        tick_bitmap: Dict[int, Dict[str, Any]] | polars.DataFrame | None = None,
+        tick_data: Mapping[Any, Mapping[Any, Any]]
+        | Dict[int, UniswapV3LiquidityAtTick]
+        | polars.DataFrame
+        | None = None,
+        tick_bitmap: Mapping[Any, Mapping[Any, Any]]
+        | Dict[int, UniswapV3BitmapAtWord]
+        | polars.DataFrame
+        | None = None,
         state_block: int | None = None,
     ):
         self.address = to_checksum_address(address)
@@ -241,34 +248,93 @@ class V3LiquidityPool(BaseLiquidityPool):
             match tick_bitmap:
                 case polars.DataFrame():
                     self.tick_bitmap = tick_bitmap
+                case dict() if tick_bitmap == {}:
+                    self.tick_bitmap = EMPTY_TICK_BITMAP
                 case dict():
-                    self.tick_bitmap = polars.DataFrame(
-                        data={
-                            "word": tick_bitmap.keys(),
-                            "bitmap": [str(value.bitmap) for value in tick_bitmap.values()],
-                        },
-                        schema=TICK_BITMAP_SCHEMA,
-                    )
+                    _, first_value = list(tick_bitmap.items())[0]
+
+                    match first_value:
+                        case UniswapV3BitmapAtWord():
+                            self.tick_bitmap = polars.DataFrame(
+                                data={
+                                    "word": tick_bitmap.keys(),
+                                    "bitmap": [str(value.bitmap) for value in tick_bitmap.values()],
+                                },
+                                schema=TICK_BITMAP_SCHEMA,
+                            )
+                        case dict():
+                            self.tick_bitmap = polars.DataFrame(
+                                data={
+                                    # cast() is used here to satisfy mypy, since pattern matching
+                                    # can't narrow the type of all values used in a dict with
+                                    # multiple keys
+                                    "word": [int(word) for word in tick_bitmap.keys()],
+                                    "bitmap": [
+                                        str(value["bitmap"])
+                                        for value in cast(
+                                            Dict[str, Any],
+                                            tick_bitmap,
+                                        ).values()
+                                    ],
+                                },
+                                schema=TICK_BITMAP_SCHEMA,
+                            )
+                        case _:
+                            raise ValueError("Did not recognize bitmap format.")
                 case _:
-                    raise ValueError("Unsupported tick_bitmap type")
+                    raise ValueError("Unknown tick_bitmap type.")
 
         if tick_data is not None:
             match tick_data:
                 case polars.DataFrame():
                     self.tick_data = tick_data
+                case dict() if tick_data == {}:
+                    self.tick_data = EMPTY_TICK_DATA
                 case dict():
-                    self.tick_data = polars.DataFrame(
-                        data={
-                            "tick": tick_data.keys(),
-                            "liquidityNet": [
-                                str(value.liquidityNet) for value in tick_data.values()
-                            ],
-                            "liquidityGross": [
-                                str(value.liquidityGross) for value in tick_data.values()
-                            ],
-                        },
-                        schema=TICK_DATA_SCHEMA,
-                    )
+                    _, first_value = list(tick_data.items())[0]
+
+                    match first_value:
+                        case UniswapV3LiquidityAtTick():
+                            self.tick_data = polars.DataFrame(
+                                data={
+                                    "tick": tick_data.keys(),
+                                    "liquidityNet": [
+                                        str(liquidity_at_tick.liquidityNet)
+                                        for liquidity_at_tick in tick_data.values()
+                                    ],
+                                    "liquidityGross": [
+                                        str(liquidity_at_tick.liquidityGross)
+                                        for liquidity_at_tick in tick_data.values()
+                                    ],
+                                },
+                                schema=TICK_DATA_SCHEMA,
+                            )
+                        case dict():
+                            self.tick_data = polars.DataFrame(
+                                data={
+                                    # cast() here used to satisfy mypy, since pattern matching
+                                    # can't narrow the type of all values used in a dict with
+                                    # multiple keys
+                                    "tick": [int(tick) for tick in tick_data.keys()],
+                                    "liquidityNet": [
+                                        str(liquidity_at_tick["liquidityNet"])
+                                        for liquidity_at_tick in cast(
+                                            Dict[Any, Any],
+                                            tick_data,
+                                        ).values()
+                                    ],
+                                    "liquidityGross": [
+                                        str(liquidity_at_tick["liquidityGross"])
+                                        for liquidity_at_tick in cast(
+                                            Dict[Any, Any],
+                                            tick_data,
+                                        ).values()
+                                    ],
+                                },
+                                schema=TICK_DATA_SCHEMA,
+                            )
+                        case _:
+                            raise ValueError("Did not recognize liquidity data format.")
                 case _:
                     raise ValueError("Unknown tick_data type")
 
@@ -382,8 +448,8 @@ class V3LiquidityPool(BaseLiquidityPool):
         override_start_liquidity: int | None = None,
         override_start_sqrt_price_x96: int | None = None,
         override_start_tick: int | None = None,
-        override_tick_data: Dict[int, Any] | None = None,
-        override_tick_bitmap: Dict[int, Any] | None = None,
+        override_tick_data: polars.DataFrame | None = None,
+        override_tick_bitmap: polars.DataFrame | None = None,
     ) -> Tuple[int, int, int, int, int]:
         """
         This function is ported and adapted from the UniswapV3Pool.sol contract at

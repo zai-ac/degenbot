@@ -51,7 +51,7 @@ class UniswapV3LiquiditySnapshot:
 
         self.newest_block = json_liquidity_snapshot.pop("snapshot_block")
 
-        self._liquidity_snapshot: Dict[ChecksumAddress, polars.DataFrame] = {
+        self._liquidity_snapshot: Dict[ChecksumAddress, Dict[str, polars.DataFrame]] = {
             to_checksum_address(pool_address): {
                 "tick_bitmap": polars.DataFrame(
                     data={
@@ -102,7 +102,10 @@ class UniswapV3LiquiditySnapshot:
         try:
             self._liquidity_snapshot[pool_address]
         except KeyError:
-            self._liquidity_snapshot[pool_address] = {}
+            self._liquidity_snapshot[pool_address] = {
+                "tick_bitmap": EMPTY_TICK_BITMAP,
+                "tick_data": EMPTY_TICK_DATA,
+            }
 
     def fetch_new_liquidity_events(
         self,
@@ -191,23 +194,21 @@ class UniswapV3LiquiditySnapshot:
             for event in sorted_events
         ]
 
-    def get_tick_bitmap(self, pool: ChecksumAddress | str) -> polars.DataFrame:
+    def get_tick_bitmap(self, pool: ChecksumAddress | str) -> polars.DataFrame | None:
         pool_address = to_checksum_address(pool)
 
         try:
             return self._liquidity_snapshot[pool_address]["tick_bitmap"]
         except KeyError:
-            # Assume the snapshot is complete and the pool has no initialized ticks
-            return EMPTY_TICK_BITMAP
+            return None
 
-    def get_tick_data(self, pool: ChecksumAddress | str) -> polars.DataFrame:
+    def get_tick_data(self, pool: ChecksumAddress | str) -> polars.DataFrame | None:
         pool_address = to_checksum_address(pool)
 
         try:
             return self._liquidity_snapshot[pool_address]["tick_data"]
         except KeyError:
-            # Assume the snapshot is complete and the pool has no initialized ticks
-            return EMPTY_TICK_DATA
+            return None
 
     def update_snapshot(
         self,
@@ -218,13 +219,20 @@ class UniswapV3LiquiditySnapshot:
         pool_address = to_checksum_address(pool)
 
         self._add_pool_if_missing(pool_address)
-        self._liquidity_snapshot[pool_address].update(
-            {
-                "tick_bitmap": tick_bitmap,
-            }
+
+        self._liquidity_snapshot[pool_address]["tick_bitmap"] = self._liquidity_snapshot[
+            pool_address
+        ]["tick_bitmap"].update(
+            other=tick_bitmap,
+            left_on=["word"],
+            right_on=["word"],
+            how="full",
         )
-        self._liquidity_snapshot[pool_address].update(
-            {
-                "tick_data": tick_data,
-            }
+        self._liquidity_snapshot[pool_address]["tick_data"] = self._liquidity_snapshot[
+            pool_address
+        ]["tick_data"].update(
+            other=tick_data,
+            left_on=["tick"],
+            right_on=["tick"],
+            how="full",
         )

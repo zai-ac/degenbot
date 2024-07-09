@@ -19,7 +19,8 @@ from degenbot.uniswap.v3_dataclasses import (
     UniswapV3PoolSimulationResult,
     UniswapV3PoolState,
 )
-from degenbot.uniswap.v3_liquidity_pool import V3LiquidityPool
+
+from degenbot.uniswap.v3_liquidity_pool import V3LiquidityPool, TICK_BITMAP_SCHEMA, TICK_DATA_SCHEMA
 from hexbytes import HexBytes
 from web3 import Web3
 
@@ -175,6 +176,85 @@ def test_tick_data_equality() -> None:
     assert UniswapV3LiquidityAtTick(
         liquidityNet=1, liquidityGross=2, block=3
     ) == UniswapV3LiquidityAtTick(liquidityNet=1, liquidityGross=2, block=4)
+
+
+def test_liquidity_values(ethereum_full_node_web3: Web3) -> None:
+    set_web3(ethereum_full_node_web3)
+
+    tick_bitmap_as_dict = {
+        0: {"bitmap": 0, "block": 69},
+    }
+    tick_bitmap_as_dataclass = {
+        0: UniswapV3BitmapAtWord(bitmap=0, block=69),
+    }
+    tick_bitmap_as_dataframe = polars.DataFrame(
+        data={
+            "word": [0],
+            "bitmap": ["0"],
+        },
+        schema=TICK_BITMAP_SCHEMA,
+    )
+
+    tick_data_as_dict = {
+        0: {
+            "liquidityGross": 0,
+            "liquidityNet": 0,
+            "block": 69,
+        }
+    }
+    tick_data_as_dataclass = {
+        0: UniswapV3LiquidityAtTick(liquidityGross=0, liquidityNet=0, block=69),
+    }
+    tick_data_as_dataframe = polars.DataFrame(
+        data={
+            "tick": [0],
+            "liquidityGross": ["0"],
+            "liquidityNet": ["0"],
+        },
+        schema=TICK_DATA_SCHEMA,
+    )
+
+    # All dataclass inputs
+    lp = V3LiquidityPool(
+        WBTC_WETH_V3_POOL_ADDRESS,
+        tick_bitmap=tick_bitmap_as_dataclass,
+        tick_data=tick_data_as_dataclass,
+    )
+    assert lp.tick_bitmap.equals(tick_bitmap_as_dataframe)
+    assert lp.tick_data.equals(tick_data_as_dataframe)
+
+    # All dict inputs
+    lp = V3LiquidityPool(
+        WBTC_WETH_V3_POOL_ADDRESS,
+        tick_bitmap=tick_bitmap_as_dict,
+        tick_data=tick_data_as_dict,
+    )
+    assert lp.tick_bitmap.equals(tick_bitmap_as_dataframe)
+    assert lp.tick_data.equals(tick_data_as_dataframe)
+
+    # All DataFrame inputs
+    lp = V3LiquidityPool(
+        WBTC_WETH_V3_POOL_ADDRESS,
+        tick_bitmap=tick_bitmap_as_dataframe,
+        tick_data=tick_data_as_dataframe,
+    )
+    assert lp.tick_bitmap.equals(tick_bitmap_as_dataframe)
+    assert lp.tick_data.equals(tick_data_as_dataframe)
+
+    # Mixed inputs
+    lp = V3LiquidityPool(
+        WBTC_WETH_V3_POOL_ADDRESS,
+        tick_bitmap=tick_bitmap_as_dataclass,
+        tick_data=tick_data_as_dict,
+    )
+    assert lp.tick_bitmap.equals(tick_bitmap_as_dataframe)
+
+    lp = V3LiquidityPool(
+        WBTC_WETH_V3_POOL_ADDRESS,
+        tick_bitmap=tick_bitmap_as_dict,
+        tick_data=tick_data_as_dataclass,
+    )
+    assert lp.tick_bitmap.equals(tick_bitmap_as_dataframe)
 
 
 def test_pool_state_equality(wbtc_weth_v3_lp_at_block_17_600_000: V3LiquidityPool) -> None:

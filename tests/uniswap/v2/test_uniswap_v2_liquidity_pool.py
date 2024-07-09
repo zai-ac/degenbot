@@ -592,12 +592,8 @@ def test_comparisons(
 
 
 def test_reorg(ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_block_17_600_000: LiquidityPool):
-    from pprint import pprint
-
     starting_state = ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_block_17_600_000.state
     starting_block = ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_block_17_600_000.update_block
-
-    pprint(ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_block_17_600_000._pool_state_archive)
 
     _FIRST_UPDATE_BLOCK = (
         ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_block_17_600_000.update_block + 1
