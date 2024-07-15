@@ -3,15 +3,25 @@ from ...exceptions import EVMRevertError
 from . import yul_operations as yul
 
 MIN_TICK = -887272
-MAX_TICK = -MIN_TICK
+MAX_TICK = 887272
 MIN_SQRT_RATIO = 4295128739
 MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342
 
 
 def getSqrtRatioAtTick(tick: int) -> int:
+    """
+    Calculate the sqrtPriceX96 value from the given tick.
+
+    This uses the Uniswap V3 TickMath.sol approximation method, instead of a direct calculation.
+    """
+
     abs_tick = abs(tick)
     if not (0 <= abs_tick <= MAX_TICK):
         raise EVMRevertError("T")
+
+    # Background references on this square root solving method:
+    # https://ethereum.stackexchange.com/questions/162021/how-does-uniswap-v3-core-derive-the-look-up-table-used-in-tickmath
+    # https://github.com/panoptic-labs/panoptic-v1-core/blob/main/contracts/libraries/Math.sol#L113
 
     ratio = (
         0xFFFCB933BD6FAD37AA2D162D1A594001
@@ -59,7 +69,7 @@ def getSqrtRatioAtTick(tick: int) -> int:
         ratio = (ratio * 0x48A170391F7DC42444E8FA2) >> 128
 
     if tick > 0:
-        ratio = (MAX_UINT256) // ratio
+        ratio = MAX_UINT256 // ratio
 
     # this divides by 1<<32 rounding up to go from a Q128.128 to a Q128.96
     # we then downcast because we know the result always fits within 160 bits due to our tick input constraint
