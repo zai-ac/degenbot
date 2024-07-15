@@ -52,6 +52,7 @@ class LiquidityPool(BaseLiquidityPool):
         silent: bool = False,
         state_block: int | None = None,
         empty: bool = False,
+        archive_states: bool = True,
     ) -> None:
         """
         Create a new `LiquidityPool` object for interaction with a Uniswap
@@ -121,8 +122,11 @@ class LiquidityPool(BaseLiquidityPool):
 
         if state_block is None:
             state_block = w3.eth.block_number
-        self.update_block = state_block
-        self.auto_update(block_number=state_block)
+        self._update_block = state_block
+
+        self._pool_state_archive: Dict[int, UniswapV2PoolState] = {}
+        if archive_states:
+            self._pool_state_archive[self._update_block] = self.state
 
         self.factory: ChecksumAddress
         self.fee_token0: Fraction
@@ -216,11 +220,11 @@ class LiquidityPool(BaseLiquidityPool):
                 "The 'event' update method is inaccurate and unsupported, please update your bot to use the default 'polling' method"
             )
 
-        self._pool_state_archive: Dict[int, UniswapV2PoolState] = {self.update_block: self.state}
-
         AllPools(chain_id)[self.address] = self
 
         self._subscribers = set()
+
+        self.auto_update(block_number=state_block)
 
         if not cached_pool_data:
             with get_db_session() as session:
@@ -273,6 +277,10 @@ class LiquidityPool(BaseLiquidityPool):
         return config.get_web3().eth.contract(address=self.address, abi=self.abi)
 
     @property
+    def update_block(self) -> int:
+        return self._update_block
+
+    @property
     def reserves_token0(self) -> int:
         return self.state.reserves_token0
 
@@ -283,19 +291,6 @@ class LiquidityPool(BaseLiquidityPool):
     @property
     @override
     def state(self) -> UniswapV2PoolState:
-        if self._state is None:
-            current_block = config.get_web3().eth.get_block_number()
-            logger.debug(f"Getting initial state for {self} at block {current_block}")
-            reserves0, reserves1, *_ = self._w3_contract.functions.getReserves().call(
-                block_identifier=current_block
-            )
-            self.update_block = current_block
-            self._state = UniswapV2PoolState(
-                pool=self.address,
-                reserves_token0=reserves0,
-                reserves_token1=reserves1,
-            )
-            self._pool_state_archive[current_block] = self._state
         return self._state
 
     @state.setter
@@ -542,6 +537,10 @@ class LiquidityPool(BaseLiquidityPool):
         """
         Discard states recorded prior to a target block.
         """
+
+        if not self._pool_state_archive:
+            raise NoPoolStateAvailable("No archived states are available")
+
         with self._state_lock:
             known_blocks = list(self._pool_state_archive.keys())
 
@@ -565,6 +564,9 @@ class LiquidityPool(BaseLiquidityPool):
         Use this method to maintain consistent state data following a chain re-organization.
         """
 
+        if not self._pool_state_archive:
+            raise NoPoolStateAvailable("No archived states are available")
+
         with self._state_lock:
             known_blocks = list(self._pool_state_archive.keys())
 
@@ -585,7 +587,7 @@ class LiquidityPool(BaseLiquidityPool):
                 del self._pool_state_archive[block]
 
             # Restore previous state and block
-            self.update_block, self.state = list(self._pool_state_archive.items())[-1]
+            self._update_block, self.state = list(self._pool_state_archive.items())[-1]
             self._notify_subscribers(message=UniswapV2PoolStateUpdated(self.state))
 
     def set_swap_target(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
@@ -747,18 +749,18 @@ class LiquidityPool(BaseLiquidityPool):
             update_block = config.get_web3().eth.get_block_number()
 
         # discard stale updates, but allow updating the same pool multiple times per block (necessary if sending sync events individually)
-        if update_block < self.update_block:
+        if update_block < self._update_block:
             raise ExternalUpdateError(
-                f"Current state recorded at block {self.update_block}, received update for stale block {update_block}"
+                f"Current state recorded at block {self._update_block}, received update for stale block {update_block}"
             )
         else:
-            self.update_block = update_block
+            self._update_block = update_block
 
         state_updated = False
         if update_method == "polling":
             try:
                 reserves0, reserves1, *_ = _w3_contract.functions.getReserves().call(
-                    block_identifier=self.update_block
+                    block_identifier=self._update_block
                 )
                 if (self.reserves_token0, self.reserves_token1) != (reserves0, reserves1):
                     self.state = UniswapV2PoolState(
@@ -766,8 +768,9 @@ class LiquidityPool(BaseLiquidityPool):
                         reserves_token0=reserves0,
                         reserves_token1=reserves1,
                     )
-                    # self.reserves_token0, self.reserves_token1 = reserves0, reserves1
-                    self._pool_state_archive[update_block] = self.state
+
+                    if self._pool_state_archive:
+                        self._pool_state_archive[update_block] = self.state
 
                     self._notify_subscribers(
                         message=UniswapV2PoolStateUpdated(self.state),
@@ -806,10 +809,10 @@ class LiquidityPool(BaseLiquidityPool):
                     reserves_token0=external_token0_reserves,
                     reserves_token1=external_token1_reserves,
                 )
-                # self.reserves_token0 = external_token0_reserves
-                # self.reserves_token1 = external_token1_reserves
 
-                self._pool_state_archive[update_block] = self.state
+                if self._pool_state_archive:
+                    self._pool_state_archive[update_block] = self.state
+
                 self._notify_subscribers(
                     message=UniswapV2PoolStateUpdated(self.state),
                 )

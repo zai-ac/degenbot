@@ -356,12 +356,16 @@ class UniswapV3LiquidityPoolManager(UniswapLiquidityPoolManager):
 
         starting_state_block = pool._update_block
 
-        # Apply updates and restore the non-liquidity state at the update block
-        for liquidity_update in self._snapshot.get_new_liquidity_updates(pool.address):
-            try:
-                pool.external_update(liquidity_update)
-            except ExternalUpdateError as exc:
-                logger.info(f"{exc=}")
+        # Apply liquidity modifications
+        for i, liquidity_update in enumerate(
+            self._snapshot.get_new_liquidity_updates(pool.address)
+        ):
+            if i == 0:
+                pool._update_block = liquidity_update.block_number
+
+            pool.external_update(liquidity_update)
+
+        # Restore the slot0 values state at the original creation block
         pool.auto_update(block_number=starting_state_block)
 
     def get_pool(
@@ -409,11 +413,11 @@ class UniswapV3LiquidityPoolManager(UniswapLiquidityPoolManager):
                 and "tick_data" not in v3liquiditypool_kwargs
             ):
                 tick_bitmap = self._snapshot.get_tick_bitmap(pool_address)
-                if tick_bitmap is not None and not tick_bitmap.is_empty():
+                if tick_bitmap is not None:
                     v3liquiditypool_kwargs["tick_bitmap"] = tick_bitmap
 
                 tick_data = self._snapshot.get_tick_data(pool_address)
-                if tick_data is not None and not tick_data.is_empty():
+                if tick_data is not None:
                     v3liquiditypool_kwargs["tick_data"] = tick_data
             else:
                 logger.info("Initializing pool without liquidity snapshot.")

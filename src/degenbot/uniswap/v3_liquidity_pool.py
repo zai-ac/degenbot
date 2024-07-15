@@ -110,6 +110,7 @@ class V3LiquidityPool(BaseLiquidityPool):
         | polars.DataFrame
         | None = None,
         state_block: int | None = None,
+        archive_states: bool = True,
     ):
         self.address = to_checksum_address(address)
         self.abi = abi if abi is not None else UNISWAP_V3_POOL_ABI
@@ -144,9 +145,9 @@ class V3LiquidityPool(BaseLiquidityPool):
             cached_pool_data = session.exec(selection).first()
 
         if cached_pool_data:
-            self.factory = to_checksum_address(cached_pool_data.factory)
-            token0_address = to_checksum_address(cached_pool_data.token0)
-            token1_address = to_checksum_address(cached_pool_data.token1)
+            self.factory = cached_pool_data.factory
+            token0_address = cached_pool_data.token0
+            token1_address = cached_pool_data.token1
             self._fee = cached_pool_data.fee
             deployer_address = cached_pool_data.deployer
         else:
@@ -164,15 +165,6 @@ class V3LiquidityPool(BaseLiquidityPool):
         else:
             self.deployer = self.factory
 
-        token_manager = Erc20TokenHelperManager(w3.eth.chain_id)
-        self.token0 = token_manager.get_erc20token(
-            address=token0_address,
-            silent=silent,
-        )
-        self.token1 = token_manager.get_erc20token(
-            address=token1_address,
-            silent=silent,
-        )
         token_manager = Erc20TokenHelperManager(w3.eth.chain_id)
         self.token0 = token_manager.get_erc20token(
             address=token0_address,
@@ -227,8 +219,6 @@ class V3LiquidityPool(BaseLiquidityPool):
             warnings.warn(
                 "The `update_method` argument to `V3LiquidityPool()` is unused and otherwise ignored. Remove it to stop seeing this message."
             )
-            self._update_method = update_method
-        self._extra_words = extra_words
 
         # Default to an empty, sparse bitmap with no tick data
         self.tick_data = EMPTY_TICK_DATA
@@ -240,11 +230,18 @@ class V3LiquidityPool(BaseLiquidityPool):
                 f"Must provide both tick_bitmap and tick_data! Got {tick_bitmap=}, {tick_data=}"
             )
 
-        if tick_bitmap is not None and tick_data is not None:
-            # if a snapshot was provided, assume it is complete
+        self._extra_words = extra_words
+        if tick_bitmap is None and tick_data is None:
+            word_position, _ = self._get_tick_bitmap_word_and_bit_position(self.tick)
+            self.tick_bitmap, self.tick_data = self._fetch_tick_data_at_word(
+                tick_bitmap=self.tick_bitmap,
+                tick_data=self.tick_data,
+                word_position=word_position,
+                block_number=self._update_block,
+            )
+        else:
             self._sparse_bitmap = False
 
-        if tick_bitmap is not None:
             match tick_bitmap:
                 case polars.DataFrame():
                     self.tick_bitmap = tick_bitmap
@@ -284,7 +281,6 @@ class V3LiquidityPool(BaseLiquidityPool):
                 case _:
                     raise ValueError("Unknown tick_bitmap type.")
 
-        if tick_data is not None:
             match tick_data:
                 case polars.DataFrame():
                     self.tick_data = tick_data
@@ -338,44 +334,13 @@ class V3LiquidityPool(BaseLiquidityPool):
                 case _:
                     raise ValueError("Unknown tick_data type")
 
-        if tick_bitmap is None and tick_data is None:
-            word_position, _ = self._get_tick_bitmap_word_and_bit_position(self.tick)
-            self.tick_bitmap, self.tick_data = self._fetch_tick_data_at_word(
-                tick_bitmap=self.tick_bitmap,
-                tick_data=self.tick_data,
-                word_position=word_position,
-                block_number=self._update_block,
-            )
+        self._pool_state_archive: Dict[int, UniswapV3PoolState] = {}
+        if archive_states:
+            self._pool_state_archive[self._update_block] = self.state
 
-        self._pool_state_archive: Dict[int, UniswapV3PoolState] = {
-            0: UniswapV3PoolState(
-                pool=self.address,
-                liquidity=0,
-                sqrt_price_x96=0,
-                tick=0,
-            ),
-            self._update_block: self.state,
-        }
-
-        AllPools(w3.eth.chain_id)[self.address] = self
         AllPools(w3.eth.chain_id)[self.address] = self
 
         self._subscribers = set()
-
-        if not cached_pool_data:
-            with get_db_session() as session:
-                session.add(
-                    UniswapV3LiquidityPoolData(
-                        chain_id=w3.eth.chain_id,
-                        address=self.address,
-                        factory=self.factory,
-                        deployer=self.deployer,
-                        token0=self.token0.address,
-                        token1=self.token1.address,
-                        fee=self._fee,
-                    )
-                )
-                session.commit()
 
         if not cached_pool_data:
             with get_db_session() as session:
@@ -657,7 +622,8 @@ class V3LiquidityPool(BaseLiquidityPool):
             )
         )
 
-        # TODO: document this nonsense
+        # Polars DataFrames are immutable, so store any changes to the attribute if overrides
+        # were not provided
         if override_tick_bitmap is None:
             self.tick_bitmap = _tick_bitmap
         if override_tick_data is None:
@@ -735,6 +701,10 @@ class V3LiquidityPool(BaseLiquidityPool):
         Retrieves the word and bit position (both zero indexed) for the tick. Accounts for the pool spacing.
         """
         return TickBitmap.position(int(Decimal(tick) // self._tick_spacing))
+
+    @property
+    def update_block(self) -> int:
+        return self._update_block
 
     @property
     def liquidity(self) -> int:
@@ -865,11 +835,14 @@ class V3LiquidityPool(BaseLiquidityPool):
                 updated = True
                 self.liquidity = _liquidity
 
+            self._update_block = block_number
+
             if updated:
                 self._notify_subscribers(
                     message=UniswapV3PoolStateUpdated(self.state),
                 )
-                self._pool_state_archive[block_number] = self.state
+                if self._pool_state_archive:
+                    self._pool_state_archive[block_number] = self.state
 
             if not silent:  # pragma: no cover
                 logger.info(f"Liquidity: {self.liquidity}")
@@ -1175,7 +1148,8 @@ class V3LiquidityPool(BaseLiquidityPool):
                 logger.debug(f"update block: {update.block_number} (last={self._update_block})")
 
             if updated_state:
-                self._pool_state_archive[update.block_number] = self.state
+                if self._pool_state_archive:
+                    self._pool_state_archive[update.block_number] = self.state
                 self._notify_subscribers(
                     message=UniswapV3PoolStateUpdated(self.state),
                 )
@@ -1266,6 +1240,9 @@ class V3LiquidityPool(BaseLiquidityPool):
         # block_index=3, since block 104 is at index=4. The state held at
         # index=3 is for block 103.
         # block_index = self._pool_state_archive.bisect_left(block)
+
+        if not self._pool_state_archive:
+            raise NoPoolStateAvailable("No archived states are available")
 
         with self._state_lock:
             known_blocks = list(self._pool_state_archive.keys())
